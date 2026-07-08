@@ -4,10 +4,9 @@ import re
 import random
 import csv
 from typing import Generator, Dict, Any, List
-from .config import LINKS_FILE, PROCESSED_DATA_FILE, STATS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD
+from .config import LINKS_FILE, PROCESSED_DATA_FILE, STATS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD, RAW_DOWNLOADS_DIR
 from .utils import compute_hash, score_sample_quality, detect_language
 
-# Check if requests is available, fall back to urllib
 try:
     import requests
     HAS_REQUESTS = True
@@ -27,20 +26,18 @@ class DatasetEngine:
     Highly robust and efficient Dataset Engine designed for 1-bit ARM64/Mobile systems.
     Downloads datasets safely, filters, scores quality, removes duplicates, streams
     data, and produces extensive pre-training statistics.
-    
-    Termux-Safe Architecture:
-    - Automatically detects if 'pyarrow' is missing (which is common on ARM64 Termux).
-    - If pyarrow is missing, it skips the heavy 'datasets' library and uses a custom,
-      pure-Python Hugging Face Repository Parser to fetch and parse JSON, JSONL, CSV, and TXT
-      files directly using standard web APIs.
-    - Includes a highly realistic offline synthetic fallback generator for sandboxed/restricted environments.
+    Saves all downloaded raw files inside 'downloads/' in the repository.
     """
     def __init__(self):
         self.links_file = LINKS_FILE
         self.processed_data_file = PROCESSED_DATA_FILE
         self.stats_file = STATS_FILE
-        self.raw_cache_dir = os.path.join("cache", "raw_files")
+        self.raw_cache_dir = RAW_DOWNLOADS_DIR
         os.makedirs(self.raw_cache_dir, exist_ok=True)
+        
+        # State tracking to bypass slow connection handshakes when offline/restricted
+        self.datasets_api_active = HAS_DATASETS_AND_ARROW
+        self.pure_python_api_active = True
         
         # In-memory tracking for statistics
         self.stats = {
@@ -80,40 +77,36 @@ class DatasetEngine:
         return url
 
     def fetch_web_json(self, url: str) -> Any:
-        """Helper to fetch JSON from web in pure Python without extra dependencies."""
+        """Helper to fetch JSON from web in pure Python."""
         if HAS_REQUESTS:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=5)
             response.raise_for_status()
             return response.json()
         else:
-            with urllib.request.urlopen(url, timeout=10) as response:
+            with urllib.request.urlopen(url, timeout=5) as response:
                 return json.loads(response.read().decode('utf-8'))
 
     def download_web_file(self, url: str, dest_path: str):
         """Helper to download a file from the web safely with resume capability."""
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         
-        # Check if file exists to resume/skip download
         if os.path.exists(dest_path):
             return
             
         if HAS_REQUESTS:
-            response = requests.get(url, stream=True, timeout=15)
+            response = requests.get(url, stream=True, timeout=5)
             response.raise_for_status()
             with open(dest_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
         else:
-            with urllib.request.urlopen(url, timeout=15) as response:
+            with urllib.request.urlopen(url, timeout=5) as response:
                 with open(dest_path, 'wb') as f:
                     f.write(response.read())
 
     def detect_dataset_type(self, sample: Dict[str, Any]) -> str:
-        """
-        Automatically detects the type of dataset based on sample features.
-        Types: Chat, SFT, QA, Code, ImageCaption, RawText
-        """
+        """Automatically detects the type of dataset based on sample features."""
         keys = set(sample.keys())
         
         if "messages" in keys or "conversations" in keys:
@@ -191,15 +184,12 @@ class DatasetEngine:
         """
         Pure-Python fallback to stream and parse Hugging Face dataset files
         without PyArrow or standard Hugging Face datasets library.
-        Queries the Hugging Face Web API to get repository file trees and downloads text formats.
         """
         samples = []
         try:
-            # Query file list from Hugging Face datasets repository API
             api_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
             file_tree = self.fetch_web_json(api_url)
             
-            # Filter files with readable text formats: json, jsonl, csv, txt
             text_files = []
             for item in file_tree:
                 if item.get("type") == "file":
@@ -207,21 +197,18 @@ class DatasetEngine:
                     if path.endswith((".json", ".jsonl", ".csv", ".txt")):
                         text_files.append(path)
                         
-            # Loop through first 2 found text files to avoid extreme download bloat
             for file_path in text_files[:2]:
                 local_dest = os.path.join(self.raw_cache_dir, repo_id, file_path)
                 download_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
                 
-                # Download and cache raw file
                 self.download_web_file(download_url, local_dest)
                 
-                # Parse depending on format
                 if file_path.endswith(".jsonl"):
                     with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
                         for line in f:
                             if line.strip():
                                 samples.append(json.loads(line))
-                                if len(samples) >= 100:  # limit samples per file for mobile
+                                if len(samples) >= 100:
                                     break
                 elif file_path.endswith(".json"):
                     with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
@@ -229,7 +216,6 @@ class DatasetEngine:
                         if isinstance(data, list):
                             samples.extend(data[:100])
                         elif isinstance(data, dict):
-                            # Check if split by columns or rows
                             for key in ["train", "data", "rows"]:
                                 if key in data and isinstance(data[key], list):
                                     samples.extend(data[key][:100])
@@ -250,16 +236,13 @@ class DatasetEngine:
                                 samples.append({"text": line.strip()})
                                 if len(samples) >= 100:
                                     break
-        except Exception as e:
-            # Silence web/connection errors, we will fallback to synthetic generator
-            pass
+        except Exception:
+            raise  # bubble up to disable the pure-python API if offline
             
         return samples
 
     def generate_mock_samples(self, repo_id: str, count: int = 15) -> List[Dict[str, Any]]:
-        """
-        Generates rich, domain-specific mock/synthetic dataset samples when offline.
-        """
+        """Generates rich, domain-specific mock/synthetic dataset samples when offline."""
         samples = []
         repo_id_lower = repo_id.lower()
         
@@ -347,7 +330,7 @@ class DatasetEngine:
         """
         Downloads all datasets from links.txt, processes, de-duplicates,
         filters by quality, and writes to a single reusable cache file.
-        Uses streaming or custom PyArrow-free web parsing with a mock fallback.
+        Optimized with connection fail-safes to bypass slow retries when offline.
         """
         if not force_refresh and os.path.exists(self.processed_data_file) and os.path.exists(self.stats_file):
             print(f"[DatasetEngine] Found cached processed data at {self.processed_data_file}. Skipping preprocessing.")
@@ -383,8 +366,8 @@ class DatasetEngine:
                 loaded_samples = []
                 loaded_source = "None"
                 
-                # 1. Try PyArrow-dependent streaming if available (e.g. PC/x86 environment)
-                if HAS_DATASETS_AND_ARROW:
+                # 1. Try PyArrow-dependent streaming if available and HF datasets API is active
+                if self.datasets_api_active:
                     try:
                         dataset = load_dataset(repo_id, streaming=True)
                         splits = list(dataset.keys()) if hasattr(dataset, "keys") else ["train"]
@@ -398,18 +381,25 @@ class DatasetEngine:
                                 loaded_samples.append(raw_sample)
                                 count += 1
                         loaded_source = "HuggingFace Datasets API"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # Disable HF API instantly if a network timeout/SSL error is detected
+                        err_str = str(e)
+                        if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
+                            print("[DatasetEngine] Connection issues detected. Disabling slow HF Datasets API to bypass handshake retries.")
+                            self.datasets_api_active = False
                 
-                # 2. If pyarrow/datasets are absent (e.g. Termux), download and parse JSON/CSV files directly
-                if not loaded_samples:
+                # 2. Try Pure Python HF downloader if datasets API is disabled or failed
+                if not loaded_samples and self.pure_python_api_active:
                     try:
                         loaded_samples = self.fetch_hf_repo_files_pure_python(repo_id)
                         if loaded_samples:
                             num_files_processed += len(loaded_samples) // 100 + 1
                             loaded_source = "Pure-Python HF Repository Parser"
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        err_str = str(e)
+                        if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
+                            print("[DatasetEngine] Connection issues detected. Disabling pure-python web loader.")
+                            self.pure_python_api_active = False
                         
                 # 3. Fall back to offline synthetic generator if blocked or empty
                 if not loaded_samples:
@@ -417,7 +407,6 @@ class DatasetEngine:
                     loaded_samples = self.generate_mock_samples(repo_id, count=15)
                     loaded_source = "Offline-Safety Synthetic Fallback"
                 
-                # Process collected samples
                 count = 0
                 for raw_sample in loaded_samples:
                     total_samples_processed += 1
@@ -496,10 +485,7 @@ class DatasetEngine:
         print("="*50 + "\n")
 
     def stream_processed_samples(self) -> Generator[Dict[str, str], None, None]:
-        """
-        Streams processed samples line-by-line from the cache.
-        Loads nothing into RAM, ideal for low power ARM64 training.
-        """
+        """Streams processed samples line-by-line from the cache."""
         if not os.path.exists(self.processed_data_file):
             self.process_all_datasets()
             
