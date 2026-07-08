@@ -14,32 +14,45 @@ except ImportError:
     HAS_TORCH = False
 
 from .config import (
-    BATCH_SIZE, SEQ_LEN, EMBED_DIM, NUM_LAYERS, NUM_HEADS, LR, EPOCHS,
-    TOKENIZER_FILE, MODEL_CHECKPOINT, PROCESSED_DATA_FILE, PROGRESS_FILE, USE_16BIT
+    BATCH_SIZE, SEQ_LEN, EMBED_DIM, NUM_LAYERS, NUM_HEADS, LR, EPOCHS, USE_16BIT,
+    get_model_paths
 )
 from .utils import optimize_environment
 from .tokenizer import SimpleBPETokenizer
 from .dataset import DatasetEngine
-from .model import NumPyBitRNNLM, get_np_dtype
+from .model import NumPyBitRNNLM
 
 class Trainer:
     """
     Main Trainer for the 1-Bit AI model.
-    Optimized for Q1 binary quantization and FP16 half-precision execution.
-    Supports complete resumable training, saving state, steps, and progress logs.
+    Supports named models, customizable dataset selection, and infinite pre-training.
     """
-    def __init__(self, limit_steps: int = None):
-        self.limit_steps = limit_steps
-        self.engine = DatasetEngine()
+    def __init__(self, model_name: str = "default", limit_steps=None):
+        self.model_name = model_name
+        
+        # Handle infinite steps input
+        if limit_steps == "inf" or limit_steps == float('inf'):
+            self.limit_steps = float('inf')
+        elif limit_steps is not None:
+            self.limit_steps = int(limit_steps)
+        else:
+            self.limit_steps = None
+            
+        # Get model-specific file paths to isolate models
+        self.paths = get_model_paths(self.model_name)
+        
+        # Initialize DatasetEngine and Tokenizer with model-isolated paths
+        self.engine = DatasetEngine(self.paths["processed_data"], self.paths["stats"])
         self.tokenizer = SimpleBPETokenizer(vocab_size=4000)
         
         optimize_environment()
         
     def prepare_tokenizer(self):
-        """Trains or loads the custom tokenizer."""
-        if os.path.exists(TOKENIZER_FILE):
-            print(f"[Trainer] Loading existing tokenizer from {TOKENIZER_FILE}")
-            self.tokenizer.load(TOKENIZER_FILE)
+        """Trains or loads the custom tokenizer inside the model's directory."""
+        tokenizer_path = self.paths["tokenizer"]
+        if os.path.exists(tokenizer_path):
+            print(f"[Trainer] Loading existing tokenizer from {tokenizer_path}")
+            self.tokenizer.load(tokenizer_path)
             return
 
         print("[Trainer] Tokenizer cache not found. Training tokenizer on clean dataset sample...")
@@ -55,8 +68,8 @@ class Trainer:
             texts = ["Hello, this is a fallback training sentence for our 1-bit ARM64 model."]
             
         self.tokenizer.train_from_texts(texts)
-        self.tokenizer.save(TOKENIZER_FILE)
-        print(f"[Trainer] Tokenizer trained with vocab size {len(self.tokenizer.vocab)} and saved to {TOKENIZER_FILE}")
+        self.tokenizer.save(tokenizer_path)
+        print(f"[Trainer] Tokenizer trained with vocab size {len(self.tokenizer.vocab)} and saved to {tokenizer_path}")
 
     def get_token_chunk_stream(self) -> List[int]:
         """Streams and packs tokens into sequences of exactly SEQ_LEN + 1."""
@@ -84,14 +97,13 @@ class Trainer:
                 batch.append([self.tokenizer.pad_id] * (SEQ_LEN + 1))
             yield batch
 
-    def train(self):
+    def train(self, selected_repos: List[str] = None):
         """
-        Trains the 1-bit model.
-        Features a comprehensive, fully resumable checkpoint and progress tracker.
-        If training is interrupted, running the trainer again will resume seamlessly.
+        Trains the named 1-bit model.
+        Supports infinite steps, resuming on progress, and selecting custom repositories.
         """
         # 1. Preprocess and stats
-        self.engine.process_all_datasets()
+        self.engine.process_all_datasets(selected_repos=selected_repos)
         self.prepare_tokenizer()
         
         vocab_size = len(self.tokenizer.vocab)
@@ -101,20 +113,28 @@ class Trainer:
         
         # Load progress if it exists to support resumption!
         resumed = False
-        if os.path.exists(PROGRESS_FILE):
+        progress_path = self.paths["progress"]
+        if os.path.exists(progress_path):
             try:
-                with open(PROGRESS_FILE, 'r') as f:
+                with open(progress_path, 'r') as f:
                     progress_data = json.load(f)
                 start_epoch = progress_data.get("epoch", 1)
                 start_step = progress_data.get("step", 0)
                 loss_history = progress_data.get("loss_history", [])
-                print(f"\n[Trainer] Found existing training progress checkpoint! Resuming from Epoch {start_epoch}, Step {start_step}...")
+                print(f"\n[Trainer] Found existing progress for model '{self.model_name}'! Resuming from Epoch {start_epoch}, Step {start_step}...")
                 resumed = True
             except Exception as e:
                 print(f"[Trainer] Failed to load progress JSON: {e}. Starting fresh.")
 
+        # Infinite loop flag
+        is_infinite = (self.limit_steps == float('inf'))
+        target_epochs = 100000 if is_infinite else EPOCHS
+        
+        checkpoint_path = self.paths["checkpoint"]
+        numpy_weight_path = self.paths["numpy_weights"]
+
         if HAS_TORCH:
-            print("[Trainer] Running in HIGH-SPEED PYTORCH (Q1 Binary mode).")
+            print(f"[Trainer] Running named model '{self.model_name}' in PYTORCH mode.")
             model = BitTransformerLM(
                 vocab_size=vocab_size,
                 embed_dim=EMBED_DIM,
@@ -126,7 +146,6 @@ class Trainer:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
             
-            # Enforce float16 only on CUDA (GPU) for numeric stability on CPU
             use_fp16 = USE_16BIT and device.type == "cuda"
             if use_fp16:
                 model = model.half()
@@ -137,20 +156,20 @@ class Trainer:
             optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
             model.train()
             
-            # Load PyTorch checkpoint if resuming
-            if resumed and os.path.exists(MODEL_CHECKPOINT):
+            if resumed and os.path.exists(checkpoint_path):
                 try:
-                    model.load_state_dict(torch.load(MODEL_CHECKPOINT, map_location=device))
-                    print("[Trainer] PyTorch weights loaded successfully from checkpoint.")
+                    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+                    print(f"[Trainer] Loaded model '{self.model_name}' weights from checkpoint.")
                 except Exception as e:
-                    print(f"[Trainer] Could not load PyTorch weights: {e}. Starting fresh.")
+                    print(f"[Trainer] Could not load weights: {e}. Starting fresh.")
                     
-            print("[Trainer] Starting PyTorch Training Loop...")
+            print(f"[Trainer] Starting PyTorch Training Loop (Infinite: {is_infinite})...")
             step = 0
             total_loss = 0.0
             start_time = time.time()
             
-            for epoch in range(start_epoch, EPOCHS + 1):
+            epoch = start_epoch
+            while True:
                 chunk_gen = self.get_token_chunk_stream()
                 batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
                 
@@ -177,34 +196,37 @@ class Trainer:
                         avg_loss = total_loss / (1.0 if step == 1 or total_loss == loss.item() else 10.0)
                         loss_history.append({"epoch": epoch, "step": step, "loss": avg_loss})
                         tokens_per_sec = (step * BATCH_SIZE * SEQ_LEN) / (time.time() - start_time)
-                        print(f"Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
+                        print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
-                        # Save progression and checkpoint on the fly!
+                        # Auto-save checkpoints and training progress!
                         self.save_progress(epoch, step, loss_history)
-                        torch.save(model.state_dict(), MODEL_CHECKPOINT)
+                        torch.save(model.state_dict(), checkpoint_path)
+                        self.export_to_numpy(model)
                         
-                    if self.limit_steps and step >= self.limit_steps:
+                    if not is_infinite and self.limit_steps and step >= self.limit_steps:
                         print(f"[Trainer] Reached step limit: {self.limit_steps}")
                         break
                         
-                if self.limit_steps and step >= self.limit_steps:
+                if not is_infinite and self.limit_steps and step >= self.limit_steps:
                     break
                     
+                epoch += 1
+                if not is_infinite and epoch > target_epochs:
+                    break
                 start_step = 0
                 
-            print(f"[Trainer] Saving final PyTorch checkpoint to {MODEL_CHECKPOINT}")
-            torch.save(model.state_dict(), MODEL_CHECKPOINT)
+            print(f"[Trainer] Saving final PyTorch checkpoint to {checkpoint_path}")
+            torch.save(model.state_dict(), checkpoint_path)
             self.export_to_numpy(model)
             
-            if os.path.exists(PROGRESS_FILE):
-                os.remove(PROGRESS_FILE)
+            if not is_infinite and os.path.exists(progress_path):
+                os.remove(progress_path)
                 
         else:
-            print("\n[Trainer] Running in LOW-POWER PURE-NUMPY (16-bit Q1 Recurrent mode).")
+            print(f"\n[Trainer] Running named model '{self.model_name}' in PURE-NUMPY RNN mode.")
             model = NumPyBitRNNLM(vocab_size=vocab_size, embed_dim=EMBED_DIM, seq_len=SEQ_LEN)
             
-            numpy_weight_path = os.path.join(os.path.dirname(MODEL_CHECKPOINT), "numpy_weights.npz")
             if resumed and os.path.exists(numpy_weight_path):
                 try:
                     data = np.load(numpy_weight_path, allow_pickle=True)
@@ -222,16 +244,17 @@ class Trainer:
                     model.m_b_h, model.v_b_h = data["m_b_h"], data["v_b_h"]
                     model.m_b_y, model.v_b_y = data["m_b_y"], data["v_b_y"]
                     model.t = int(data["optimizer_t"])
-                    print("[Trainer] NumPy weights and Adam states loaded successfully from checkpoint.")
+                    print(f"[Trainer] Loaded model '{self.model_name}' weights and Adam states.")
                 except Exception as e:
-                    print(f"[Trainer] Could not load NumPy checkpoint states: {e}. Starting fresh.")
+                    print(f"[Trainer] Could not load NumPy checkpoints: {e}. Starting fresh.")
                     
-            print("[Trainer] Starting NumPy Training Loop...")
+            print(f"[Trainer] Starting NumPy Training Loop (Infinite: {is_infinite})...")
             step = 0
             total_loss = 0.0
             start_time = time.time()
             
-            for epoch in range(start_epoch, EPOCHS + 1):
+            epoch = start_epoch
+            while True:
                 chunk_gen = self.get_token_chunk_stream()
                 batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
                 
@@ -252,9 +275,10 @@ class Trainer:
                         avg_loss = total_loss / (1.0 if step == 1 or total_loss == loss else 10.0)
                         loss_history.append({"epoch": epoch, "step": step, "loss": avg_loss})
                         tokens_per_sec = (step * BATCH_SIZE * SEQ_LEN) / (time.time() - start_time)
-                        print(f"Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
+                        print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
+                        # Auto-save checkpoints and training progress!
                         self.save_progress(epoch, step, loss_history)
                         np.savez_compressed(
                             numpy_weight_path,
@@ -277,17 +301,21 @@ class Trainer:
                             optimizer_t=np.array(model.t)
                         )
                         
-                    if self.limit_steps and step >= self.limit_steps:
+                    if not is_infinite and self.limit_steps and step >= self.limit_steps:
                         print(f"[Trainer] Reached step limit: {self.limit_steps}")
                         break
                         
-                if self.limit_steps and step >= self.limit_steps:
+                if not is_infinite and self.limit_steps and step >= self.limit_steps:
                     break
                 
+                epoch += 1
+                if not is_infinite and epoch > target_epochs:
+                    break
                 start_step = 0
                 
             print(f"[Trainer] Training completed in {time.time() - start_time:.2f} seconds.")
             
+            # Save final weights
             np.savez_compressed(
                 numpy_weight_path,
                 model_type=np.array("rnn"),
@@ -310,8 +338,8 @@ class Trainer:
             )
             print(f"[Trainer] Pure NumPy 1-bit RNN weights saved successfully to {numpy_weight_path}")
             
-            if os.path.exists(PROGRESS_FILE):
-                os.remove(PROGRESS_FILE)
+            if not is_infinite and os.path.exists(progress_path):
+                os.remove(progress_path)
 
     def save_progress(self, epoch: int, step: int, loss_history: List[dict]):
         """Saves current training progression state to progress JSON file."""
@@ -321,7 +349,7 @@ class Trainer:
             "last_updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "loss_history": loss_history
         }
-        with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+        with open(self.paths["progress"], 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2)
 
     def export_to_numpy(self, model):
@@ -354,6 +382,6 @@ class Trainer:
             flat_weights[f"block_{idx}_gate_proj_w"] = state_dict[prefix + "mlp.gate_proj.weight"].cpu().numpy()
             flat_weights[f"block_{idx}_down_proj_w"] = state_dict[prefix + "mlp.down_proj.weight"].cpu().numpy()
             
-        numpy_weight_path = os.path.join(os.path.dirname(MODEL_CHECKPOINT), "numpy_weights.npz")
+        numpy_weight_path = self.paths["numpy_weights"]
         np.savez_compressed(numpy_weight_path, **flat_weights)
         print(f"[Trainer] Pure NumPy 1-bit Transformer weights exported successfully to {numpy_weight_path}")

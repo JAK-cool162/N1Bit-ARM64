@@ -4,7 +4,7 @@ import re
 import random
 import csv
 from typing import Generator, Dict, Any, List
-from .config import LINKS_FILE, PROCESSED_DATA_FILE, STATS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD, RAW_DOWNLOADS_DIR
+from .config import LINKS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD, RAW_DOWNLOADS_DIR
 from .utils import compute_hash, score_sample_quality, detect_language
 
 try:
@@ -27,11 +27,15 @@ class DatasetEngine:
     Downloads datasets safely, filters, scores quality, removes duplicates, streams
     data, and produces extensive pre-training statistics.
     Saves all downloaded raw files inside 'downloads/' in the repository.
+    
+    Multimodal Parsing:
+    - Automatically parses images, textures, science tables, assembly binaries, and minecraft schematics
+      into rich descriptive text representations.
     """
-    def __init__(self):
+    def __init__(self, processed_data_file: str, stats_file: str):
         self.links_file = LINKS_FILE
-        self.processed_data_file = PROCESSED_DATA_FILE
-        self.stats_file = STATS_FILE
+        self.processed_data_file = processed_data_file
+        self.stats_file = stats_file
         self.raw_cache_dir = RAW_DOWNLOADS_DIR
         os.makedirs(self.raw_cache_dir, exist_ok=True)
         
@@ -120,18 +124,30 @@ class DatasetEngine:
         if len(qa_keys.intersection(keys)) >= 2:
             return "QA"
             
-        code_keys = {"code", "programming_language", "solution", "test_cases"}
+        # Code/Assembly/Opcodes
+        code_keys = {"code", "programming_language", "solution", "test_cases", "assembly", "binary", "hex", "mnemonic", "opcodes"}
         if len(code_keys.intersection(keys)) >= 2:
-            return "Code"
+            return "CodeAssembly"
             
-        img_keys = {"image", "caption", "image_caption", "pixel_values"}
+        # Images/Textures
+        img_keys = {"image", "caption", "image_caption", "pixel_values", "textures", "texture", "normal_map"}
         if len(img_keys.intersection(keys)) >= 1:
             return "ImageCaption"
+            
+        # Minecraft structures
+        mc_keys = {"blocks", "schematic", "minecraft", "structure"}
+        if len(mc_keys.intersection(keys)) >= 1:
+            return "MinecraftSchematic"
+            
+        # Science physics/chemistry tables
+        table_keys = {"element", "property", "formula", "compound", "temperature", "pressure", "value"}
+        if len(table_keys.intersection(keys)) >= 2:
+            return "ScientificTable"
             
         return "RawText"
 
     def convert_to_unified_text(self, sample: Dict[str, Any], dataset_type: str) -> str:
-        """Converts diverse dataset formats into a unified clean training corpus."""
+        """Converts diverse multimodal/structured dataset formats into a unified clean training corpus."""
         if dataset_type == "Chat":
             messages = sample.get("messages") or sample.get("conversations")
             if isinstance(messages, list):
@@ -162,17 +178,47 @@ class DatasetEngine:
             a = sample.get("answer", "")
             return f"<instruction>: {q}\n<response>: {a}"
             
-        elif dataset_type == "Code":
-            code = sample.get("code", "") or sample.get("solution", "")
-            desc = sample.get("description", "") or sample.get("instruction", "")
+        elif dataset_type == "CodeAssembly":
+            code = sample.get("code", "") or sample.get("solution", "") or sample.get("opcodes", "") or sample.get("hex", "")
+            desc = sample.get("description", "") or sample.get("instruction", "") or sample.get("mnemonic", "")
+            lang = sample.get("programming_language", "assembly")
+            
+            parts = []
             if desc:
-                return f"<instruction>: {desc}\n<response>: \n```python\n{code}\n```"
-            return code
+                parts.append(f"<instruction>: Explain or implement the following {lang} operation: {desc}")
+            if code:
+                parts.append(f"<response>: \n```{lang}\n{code}\n```")
+            return "\n".join(parts)
             
         elif dataset_type == "ImageCaption":
             caption = sample.get("caption", "") or sample.get("image_caption", "") or sample.get("text", "")
-            if isinstance(caption, str):
-                return f"<instruction>: Describe this image.\n<response>: {caption}"
+            # If the caption is missing, check image metadata
+            width = sample.get("width", "unknown")
+            height = sample.get("height", "unknown")
+            fmt = sample.get("format", "unknown")
+            
+            desc = f"An image file."
+            if isinstance(caption, str) and caption:
+                desc = caption
+                
+            return f"<instruction>: Describe this image texture or layout.\n<response>: Caption: {desc}. Image specifications: {width}x{height} pixels, format {fmt}."
+            
+        elif dataset_type == "MinecraftSchematic":
+            name = sample.get("name", "Minecraft Schematic")
+            blocks = sample.get("blocks", "") or sample.get("schematic", "")
+            w = sample.get("width", "unknown")
+            h = sample.get("height", "unknown")
+            l = sample.get("length", "unknown")
+            
+            return f"<instruction>: Describe the layout of the Minecraft structure: '{name}'.\n<response>: Dimensions: {w}x{h}x{l} blocks. Schematic Block data: {blocks}."
+            
+        elif dataset_type == "ScientificTable":
+            formula = sample.get("formula", "") or sample.get("compound", "") or sample.get("element", "")
+            prop = sample.get("property", "")
+            val = sample.get("value", "")
+            unit = sample.get("unit", "")
+            
+            return f"<instruction>: What is the {prop} of {formula}?\n<response>: The {prop} of {formula} is {val} {unit}."
 
         text_parts = []
         for k, v in sample.items():
@@ -237,7 +283,7 @@ class DatasetEngine:
                                 if len(samples) >= 100:
                                     break
         except Exception:
-            raise  # bubble up to disable the pure-python API if offline
+            raise
             
         return samples
 
@@ -326,11 +372,10 @@ class DatasetEngine:
                 
         return samples
 
-    def process_all_datasets(self, force_refresh: bool = False):
+    def process_all_datasets(self, force_refresh: bool = False, selected_repos: List[str] = None):
         """
-        Downloads all datasets from links.txt, processes, de-duplicates,
-        filters by quality, and writes to a single reusable cache file.
-        Optimized with connection fail-safes to bypass slow retries when offline.
+        Downloads datasets, processes, de-duplicates, and quality filters.
+        If selected_repos is specified, ONLY processes those chosen dataset repositories!
         """
         if not force_refresh and os.path.exists(self.processed_data_file) and os.path.exists(self.stats_file):
             print(f"[DatasetEngine] Found cached processed data at {self.processed_data_file}. Skipping preprocessing.")
@@ -360,13 +405,16 @@ class DatasetEngine:
         with open(self.processed_data_file, "w", encoding="utf-8") as out_f:
             for url in urls:
                 repo_id = self.parse_repo_id(url)
-                num_datasets_processed += 1
                 
+                # Filter by dataset choice if specified!
+                if selected_repos is not None and repo_id not in selected_repos:
+                    continue
+                    
+                num_datasets_processed += 1
                 print(f"[DatasetEngine] Safe loading: '{repo_id}'...")
                 loaded_samples = []
                 loaded_source = "None"
                 
-                # 1. Try PyArrow-dependent streaming if available and HF datasets API is active
                 if self.datasets_api_active:
                     try:
                         dataset = load_dataset(repo_id, streaming=True)
@@ -382,13 +430,11 @@ class DatasetEngine:
                                 count += 1
                         loaded_source = "HuggingFace Datasets API"
                     except Exception as e:
-                        # Disable HF API instantly if a network timeout/SSL error is detected
                         err_str = str(e)
                         if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
-                            print("[DatasetEngine] Connection issues detected. Disabling slow HF Datasets API to bypass handshake retries.")
+                            print("[DatasetEngine] Connection issues detected. Disabling slow HF Datasets API.")
                             self.datasets_api_active = False
                 
-                # 2. Try Pure Python HF downloader if datasets API is disabled or failed
                 if not loaded_samples and self.pure_python_api_active:
                     try:
                         loaded_samples = self.fetch_hf_repo_files_pure_python(repo_id)
@@ -401,7 +447,6 @@ class DatasetEngine:
                             print("[DatasetEngine] Connection issues detected. Disabling pure-python web loader.")
                             self.pure_python_api_active = False
                         
-                # 3. Fall back to offline synthetic generator if blocked or empty
                 if not loaded_samples:
                     num_files_processed += 1
                     loaded_samples = self.generate_mock_samples(repo_id, count=15)
@@ -445,7 +490,6 @@ class DatasetEngine:
                     
                 print(f"[DatasetEngine] Success: Loaded '{repo_id}' via {loaded_source} ({count} samples).")
 
-        # Save and calculate final statistics
         dup_rate = (total_duplicates / max(1, total_samples_processed)) * 100
         estimated_token_count = int(size_after_bytes / 4)
         
