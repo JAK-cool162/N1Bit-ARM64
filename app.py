@@ -11,7 +11,7 @@ from typing import List, Dict
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from n1bit.config import (
-    LINKS_FILE, CACHE_DIR,
+    LINKS_FILE, CACHE_DIR, MODEL_PROFILES,
     EMBED_DIM, NUM_LAYERS, NUM_HEADS, SEQ_LEN, get_model_paths, USE_16BIT
 )
 from n1bit.tokenizer import SimpleBPETokenizer
@@ -41,6 +41,30 @@ global_state = {
     "training_progress_pct": 0,
 }
 
+def load_model_dimensions_app(model_name: str) -> tuple:
+    """Loads custom dimensions from model_config.json if it exists, otherwise uses defaults."""
+    paths = get_model_paths(model_name)
+    config_path = os.path.join(paths["model_dir"], "model_config.json")
+    
+    # Defaults
+    e_dim = EMBED_DIM
+    n_layers = NUM_LAYERS
+    n_heads = NUM_HEADS
+    s_len = SEQ_LEN
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            e_dim = cfg.get("embed_dim", EMBED_DIM)
+            n_layers = cfg.get("num_layers", NUM_LAYERS)
+            n_heads = cfg.get("num_heads", NUM_HEADS)
+            s_len = cfg.get("seq_len", SEQ_LEN)
+        except Exception:
+            pass
+            
+    return e_dim, n_layers, n_heads, s_len
+
 # =====================================================================
 # CORE API ENDPOINTS
 # =====================================================================
@@ -48,7 +72,6 @@ global_state = {
 @app.route("/api/status", methods=["GET"])
 def get_status():
     """Returns the current status of the AI engine and available models."""
-    # Scan CACHE_DIR to list available named models
     models = ["default"]
     if os.path.exists(CACHE_DIR):
         for item in os.listdir(CACHE_DIR):
@@ -60,12 +83,21 @@ def get_status():
     paths = get_model_paths(global_state["active_model"])
     model_loaded = os.path.exists(paths["numpy_weights"]) or os.path.exists(paths["checkpoint"])
     
+    # Load profile details
+    embed_dim, num_layers, num_heads, seq_len = load_model_dimensions_app(global_state["active_model"])
+    
     return jsonify({
         "active_model": global_state["active_model"],
         "is_training": global_state["is_training"],
         "has_torch": HAS_TORCH,
         "models": models,
         "model_loaded": model_loaded,
+        "dimensions": {
+            "embed_dim": embed_dim,
+            "num_layers": num_layers,
+            "num_heads": num_heads,
+            "seq_len": seq_len
+        },
         "stats": {
             "epoch": global_state["current_epoch"],
             "step": global_state["current_step"],
@@ -92,7 +124,6 @@ def list_datasets():
     urls = temp_engine.read_links()
     repos = [temp_engine.parse_repo_id(url) for url in urls]
     
-    # Load statistics for active model if available
     paths = get_model_paths(global_state["active_model"])
     stats_data = {}
     if os.path.exists(paths["stats"]):
@@ -116,7 +147,6 @@ def add_dataset():
     if not url:
         return jsonify({"error": "URL cannot be empty"}), 400
         
-    # Append to links.txt if it doesn't already exist
     existing = []
     if os.path.exists(LINKS_FILE):
         with open(LINKS_FILE, 'r', encoding='utf-8') as f:
@@ -135,14 +165,12 @@ def get_neuron_states():
     """Analyzes the current active weights of the model to show neuron grid states (+1 vs -1)."""
     paths = get_model_paths(global_state["active_model"])
     
-    # Load weights from numpy_weights.npz if it exists
     weights_file = paths["numpy_weights"]
     if not os.path.exists(weights_file):
         return jsonify({"error": "No trained model weights found for this model yet."}), 404
         
     try:
         data = np.load(weights_file, allow_pickle=True)
-        # Load representative weight matrices
         model_type = str(data.get("model_type", "transformer"))
         
         flat_signs = []
@@ -155,7 +183,6 @@ def get_neuron_states():
         positives = int(np.sum(flat_signs >= 0))
         negatives = int(np.sum(flat_signs < 0))
         
-        # Take a visual grid sample of 64 states
         sample_indices = np.random.choice(total, min(total, 64), replace=False)
         sample_grid = [1 if flat_signs[i] >= 0 else -1 for i in sample_indices]
         
@@ -188,30 +215,26 @@ def chat():
     if not os.path.exists(paths["tokenizer"]):
         return jsonify({"error": "No tokenizer found. Please train the model first."}), 400
         
-    # Initialize tokenizer
     tokenizer = SimpleBPETokenizer()
     tokenizer.load(paths["tokenizer"])
     
+    # Load dimensions
+    embed_dim, num_layers, num_heads, seq_len = load_model_dimensions_app(global_state["active_model"])
+    
     formatted_prompt = f"<instruction>: {prompt}\n<response>:"
     prompt_ids = tokenizer.encode(formatted_prompt)
-    prompt_ids = prompt_ids[-SEQ_LEN+20:]
+    prompt_ids = prompt_ids[-seq_len+20:]
     prompt_ids = [tokenizer.bos_id] + prompt_ids
     
-    # Check for active numpy weights
     if not os.path.exists(paths["numpy_weights"]):
         return jsonify({"error": "No trained weights found. Please train the model first."}), 400
         
     try:
-        # Load weights
         npz_data = np.load(paths["numpy_weights"], allow_pickle=True)
         model_type = str(npz_data.get("model_type", "transformer"))
         
-        # Perform Next-Token alternatives calculation (What the AI is thinking!)
-        # Reconstruct model and run initial forward
         if model_type == "rnn":
             vocab_size = int(npz_data["vocab_size"])
-            embed_dim = int(npz_data["embed_dim"])
-            seq_len = int(npz_data["seq_len"])
             
             model = NumPyBitRNNLM(vocab_size=vocab_size, embed_dim=embed_dim, seq_len=seq_len)
             model.E = npz_data["E"]
@@ -221,7 +244,6 @@ def chat():
             model.b_h = npz_data["b_h"]
             model.b_y = npz_data["b_y"]
             
-            # Forward pass of prompt
             h_prev = np.zeros((model.hidden_dim, 1), dtype=np.float16)
             W_xh_f, _, _ = model.q_weights(model.W_xh)
             W_hh_f, _, _ = model.q_weights(model.W_hh)
@@ -234,9 +256,8 @@ def chat():
             logits = np.dot(W_hy_f, h_prev) + model.b_y
             next_logits = logits.flatten().astype(np.float32)
         else:
-            # Reconstruct Transformer
             weights_dict = {
-                "num_heads": int(npz_data["num_heads"]),
+                "num_heads": num_heads,
                 "token_embedding": npz_data["token_embedding"],
                 "position_embedding": npz_data["position_embedding"],
                 "ln_f_w": npz_data["ln_f_w"],
@@ -267,7 +288,6 @@ def chat():
             logits = model.forward(context_ids)
             next_logits = logits[0, -1, :].astype(np.float32)
 
-        # Softmax and get Top 5 predictions
         exp_logits = np.exp(next_logits - np.max(next_logits))
         probs = exp_logits / np.sum(exp_logits)
         
@@ -281,7 +301,6 @@ def chat():
                 "probability": float(probs[idx])
             })
             
-        # Autoregressively generate full response
         output_ids = model.generate(prompt_ids, max_new_tokens=max_tokens, temperature=temperature)
         new_ids = output_ids[len(prompt_ids):]
         response_text = tokenizer.decode(new_ids).strip()
@@ -310,18 +329,23 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
     global_state["current_speed"] = 0.0
     
     try:
-        # Create trainer with isolated settings
         trainer = Trainer(model_name=model_name, limit_steps=limit_steps)
         
-        # Override the trainer's output print to stream metrics to Flask!
-        # To do this, we intercept logs by launching training and monitoring progress files.
-        # We start training in a wrapper
+        # Load dimensions
+        embed_dim, num_layers, num_heads, seq_len = load_model_dimensions_app(model_name)
+        
+        # Inject custom dimensions into n1bit trainer package globally
+        import n1bit.trainer as t_mod
+        t_mod.EMBED_DIM = embed_dim
+        t_mod.NUM_LAYERS = num_layers
+        t_mod.NUM_HEADS = num_heads
+        t_mod.SEQ_LEN = seq_len
+        
         def log_cb(msg):
             global_state["training_logs"].append(msg)
             if len(global_state["training_logs"]) > 200:
                 global_state["training_logs"].pop(0)
                 
-        # Intercept metrics via custom progress updates
         trainer.engine.process_all_datasets(selected_repos=selected_repos)
         trainer.prepare_tokenizer()
         
@@ -330,7 +354,6 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
         start_step = 0
         loss_history = []
         
-        # Auto load existing progress
         resumed = False
         progress_path = trainer.paths["progress"]
         if os.path.exists(progress_path):
@@ -352,7 +375,7 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
         numpy_weight_path = trainer.paths["numpy_weights"]
         
         log_cb(f"[System] Initializing model '{model_name}' (16-bit Q1 Recurrent RNN mode)...")
-        model = NumPyBitRNNLM(vocab_size=vocab_size, embed_dim=EMBED_DIM, seq_len=SEQ_LEN)
+        model = NumPyBitRNNLM(vocab_size=vocab_size, embed_dim=embed_dim, seq_len=seq_len)
         
         if resumed and os.path.exists(numpy_weight_path):
             try:
@@ -401,7 +424,6 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
                 loss = model.train_step(x, y, lr=LR)
                 total_loss += loss
                 
-                # Update Flask global metrics
                 global_state["current_step"] = step
                 global_state["current_epoch"] = epoch
                 global_state["current_loss"] = float(loss)
@@ -411,21 +433,20 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
                     loss_history.append({"epoch": epoch, "step": step, "loss": avg_loss})
                     
                     elapsed = time.time() - start_time
-                    tokens_per_sec = (step * BATCH_SIZE * SEQ_LEN) / max(elapsed, 1e-5)
+                    tokens_per_sec = (step * BATCH_SIZE * seq_len) / max(elapsed, 1e-5)
                     global_state["current_speed"] = tokens_per_sec
                     
                     log_msg = f"Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec"
                     log_cb(log_msg)
                     total_loss = 0.0
                     
-                    # Auto-save checkpoint!
                     trainer.save_progress(epoch, step, loss_history)
                     np.savez_compressed(
                         numpy_weight_path,
                         model_type=np.array("rnn"),
                         vocab_size=np.array(vocab_size),
-                        embed_dim=np.array(EMBED_DIM),
-                        seq_len=np.array(SEQ_LEN),
+                        embed_dim=np.array(embed_dim),
+                        seq_len=np.array(seq_len),
                         E=model.E,
                         W_xh=model.W_xh,
                         W_hh=model.W_hh,
@@ -457,13 +478,12 @@ def run_training_worker(model_name: str, limit_steps: str, selected_repos: List[
                 break
             start_step = 0
             
-        # Final weights write
         np.savez_compressed(
             numpy_weight_path,
             model_type=np.array("rnn"),
             vocab_size=np.array(vocab_size),
-            embed_dim=np.array(EMBED_DIM),
-            seq_len=np.array(SEQ_LEN),
+            embed_dim=np.array(embed_dim),
+            seq_len=np.array(seq_len),
             E=model.E,
             W_xh=model.W_xh,
             W_hh=model.W_hh,
@@ -495,7 +515,6 @@ def start_train():
     steps = data.get("steps", "inf").strip()
     selected_repos = data.get("selected_repos", None)
     
-    # Spawn thread
     global_state["training_thread"] = threading.Thread(
         target=run_training_worker,
         args=(global_state["active_model"], steps, selected_repos)
@@ -525,6 +544,44 @@ def get_logs():
         "loss": round(global_state["current_loss"], 4),
         "speed": round(global_state["current_speed"], 1)
     })
+
+@app.route("/api/create_named_model", methods=["POST"])
+def create_named_model():
+    """Creates a new named model and saves its selected hardware profile dimensions."""
+    data = request.json or {}
+    name = data.get("name", "").strip()
+    profile_id = data.get("profile", "2").strip()
+    
+    if not name:
+        return jsonify({"error": "Model name cannot be empty"}), 400
+        
+    profile = MODEL_PROFILES.get(profile_id, MODEL_PROFILES["2"])
+    paths = get_model_paths(name)
+    config_path = os.path.join(paths["model_dir"], "model_config.json")
+    
+    # Calculate parameter count (assuming vocab_size around 4000)
+    vocab_size = 4000
+    estimated_params = calculate_parameter_count(
+        vocab_size, profile["embed_dim"], profile["num_layers"], profile["seq_len"]
+    )
+    
+    model_config = {
+        "model_name": name,
+        "embed_dim": profile["embed_dim"],
+        "num_layers": profile["num_layers"],
+        "num_heads": profile["num_heads"],
+        "seq_len": profile["seq_len"],
+        "estimated_params": estimated_params
+    }
+    
+    try:
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(model_config, f, indent=2)
+            
+        global_state["active_model"] = name
+        return jsonify({"success": True, "active_model": name, "config": model_config})
+    except Exception as e:
+        return jsonify({"error": f"Failed to save model config: {e}"}), 500
 
 # =====================================================================
 # HTML EMBEDDED DASHBOARD PAGE (Tailwind CSS, Touch-optimized Mobile App UI)
@@ -586,11 +643,43 @@ HTML_TEMPLATE = """
             <select id="model-select" onchange="changeModel()" class="bg-gray-800 text-xs text-gray-200 border border-gray-700 rounded-lg px-2.5 py-1.5 focus:outline-none focus:ring-1 focus:ring-brand-500 font-semibold cursor-pointer">
                 <option value="default">default</option>
             </select>
-            <button onclick="createNewModel()" class="p-1.5 bg-gray-800 text-gray-400 hover:text-white border border-gray-700 rounded-lg" title="Create Named Model">
+            <button onclick="openCreateModelModal()" class="p-1.5 bg-gray-800 text-gray-400 hover:text-white border border-gray-700 rounded-lg" title="Create Named Model">
                 <i class="fa-solid fa-plus text-xs"></i>
             </button>
         </div>
     </header>
+
+    <!-- NEW MODEL MODAL -->
+    <div id="new-model-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <div class="bg-gray-900 border border-gray-800 w-full max-w-md rounded-2xl p-5 space-y-4">
+            <div class="flex justify-between items-center border-b border-gray-800 pb-2">
+                <h3 class="text-sm font-bold text-white uppercase tracking-wider">Initialize Named Model</h3>
+                <button onclick="closeCreateModelModal()" class="text-gray-500 hover:text-white"><i class="fa-solid fa-xmark text-sm"></i></button>
+            </div>
+            
+            <div class="space-y-3">
+                <div>
+                    <label class="block text-xs font-bold text-gray-400 mb-1">Model Name</label>
+                    <input type="text" id="modal-model-name" placeholder="e.g. coder, sandbox, physics" class="w-full bg-gray-950 border border-gray-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-brand-500 text-gray-200">
+                </div>
+                
+                <div>
+                    <label class="block text-xs font-bold text-gray-400 mb-1">Target Hardware Profile</label>
+                    <select id="modal-profile" class="w-full bg-gray-950 border border-gray-800 rounded-xl px-3 py-2 text-xs focus:outline-none focus:border-brand-500 text-gray-200 cursor-pointer">
+                        <option value="1">BUDGET (~10k-50k params) - Old/Budget Chips</option>
+                        <option value="2" selected>MIDRANGE (~100k-500k params) - Standard Chips</option>
+                        <option value="3">FLAGSHIP (~1M-5M params) - High-End/Flagship Chips</option>
+                        <option value="4">DESKTOP (10M+ params) - PCs & CUDA/Vulkan GPUs</option>
+                    </select>
+                    <p class="text-[10px] text-gray-500 mt-1">Avoid cramping a 7B model. Choose a size optimized for your hardware to prevent memory freeze!</p>
+                </div>
+            </div>
+            
+            <button onclick="submitNewModel()" class="w-full py-2 bg-brand-600 hover:bg-brand-700 text-white font-bold rounded-xl text-xs">
+                Create and Select
+            </button>
+        </div>
+    </div>
 
     <!-- MAIN BODY -->
     <main class="flex-1 max-w-6xl w-full mx-auto p-3 flex flex-col md:flex-row space-y-4 md:space-y-0 md:space-x-4">
@@ -613,6 +702,29 @@ HTML_TEMPLATE = """
                     <div class="flex justify-between items-center">
                         <span class="text-sm text-gray-400">Model Checkpoint:</span>
                         <span id="checkpoint-badge" class="text-xs font-bold px-2 py-0.5 rounded-full bg-red-500/10 text-red-400">None</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Model Dimensions Card -->
+            <div class="bg-gray-900 border border-gray-800 rounded-2xl p-4 shadow-xl">
+                <h2 class="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">Model Architecture Specs</h2>
+                <div class="space-y-2 text-xs">
+                    <div class="flex justify-between py-1 border-b border-gray-800/40">
+                        <span class="text-gray-400">Embedding Dim:</span>
+                        <span id="dim-embed" class="font-bold text-gray-200">128</span>
+                    </div>
+                    <div class="flex justify-between py-1 border-b border-gray-800/40">
+                        <span class="text-gray-400">Layers Count:</span>
+                        <span id="dim-layers" class="font-bold text-gray-200">2</span>
+                    </div>
+                    <div class="flex justify-between py-1 border-b border-gray-800/40">
+                        <span class="text-gray-400">Attention Heads:</span>
+                        <span id="dim-heads" class="font-bold text-gray-200">2</span>
+                    </div>
+                    <div class="flex justify-between py-1 border-b border-gray-800/40">
+                        <span class="text-gray-400">Max Sequence context:</span>
+                        <span id="dim-seq" class="font-bold text-gray-200">64 tokens</span>
                     </div>
                 </div>
             </div>
@@ -883,6 +995,12 @@ HTML_TEMPLATE = """
                         cpBadge.className = "text-xs font-bold px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-400";
                     }
                     
+                    // Update dimension specs dynamically!
+                    document.getElementById('dim-embed').innerText = data.dimensions.embed_dim;
+                    document.getElementById('dim-layers').innerText = data.dimensions.num_layers;
+                    document.getElementById('dim-heads').innerText = data.dimensions.num_heads;
+                    document.getElementById('dim-seq').innerText = data.dimensions.seq_len + " tokens";
+                    
                     // Update top metrics
                     document.getElementById('metric-epoch').innerText = data.stats.epoch;
                     document.getElementById('metric-step').innerText = data.stats.step;
@@ -893,7 +1011,6 @@ HTML_TEMPLATE = """
                     document.getElementById('btn-start-train').disabled = isTraining;
                     document.getElementById('btn-stop-train').disabled = !isTraining;
                     
-                    // Update training logs loop
                     if (isTraining && !logInterval) {
                         startLogging();
                     } else if (!isTraining && logInterval) {
@@ -904,7 +1021,6 @@ HTML_TEMPLATE = """
                     const select = document.getElementById('model-select');
                     const currentValue = select.value;
                     
-                    // Clear and reconstruct options
                     select.innerHTML = '';
                     data.models.forEach(m => {
                         const opt = document.createElement('option');
@@ -913,7 +1029,6 @@ HTML_TEMPLATE = """
                         select.appendChild(opt);
                     });
                     
-                    // Keep selected value
                     if (data.models.includes(currentValue)) {
                         select.value = currentValue;
                     } else {
@@ -922,7 +1037,7 @@ HTML_TEMPLATE = """
                 });
         }
 
-        // Change the active model
+        // Change active model
         function changeModel() {
             const modelName = document.getElementById('model-select').value;
             fetch('/api/select_model', {
@@ -938,22 +1053,40 @@ HTML_TEMPLATE = """
             });
         }
 
-        // Create new model name
-        function createNewModel() {
-            const name = prompt("Enter a new name for your custom model (e.g. 'coder', 'physics'):");
-            if (!name) return;
+        // Create Named Model Modal Functions
+        function openCreateModelModal() {
+            document.getElementById('new-model-modal').className = "fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4";
+        }
+        
+        function closeCreateModelModal() {
+            document.getElementById('new-model-modal').className = "hidden";
+        }
+        
+        function submitNewModel() {
+            const name = document.getElementById('modal-model-name').value.trim();
+            const profile = document.getElementById('modal-profile').value;
             
-            fetch('/api/select_model', {
+            if (!name) {
+                alert("Model name cannot be empty.");
+                return;
+            }
+            
+            fetch('/api/create_named_model', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ model_name: name })
+                body: JSON.stringify({ name: name, profile: profile })
             })
             .then(res => res.json())
             .then(data => {
-                alert(`Successfully initialized folder for model '${name}'! Select your custom dataset links and start training!`);
-                fetchStatus();
-                fetchDatasets();
-                fetchNeuronStates();
+                if (data.error) {
+                    alert(data.error);
+                } else {
+                    alert(`Successfully created named model '${name}' with optimized architecture parameters!`);
+                    closeCreateModelModal();
+                    fetchStatus();
+                    fetchDatasets();
+                    fetchNeuronStates();
+                }
             });
         }
 
@@ -963,7 +1096,6 @@ HTML_TEMPLATE = """
             document.getElementById('tab-train').className = tabId === 'tab-train' ? 'flex-1 p-4 flex flex-col space-y-4 overflow-hidden' : 'hidden';
             document.getElementById('tab-datasets').className = tabId === 'tab-datasets' ? 'flex-1 p-4 overflow-y-auto custom-scrollbar space-y-4' : 'hidden';
             
-            // Adjust buttons borders
             document.getElementById('tab-btn-chat').className = tabId === 'tab-chat' ? 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-brand-500 text-white flex items-center justify-center space-x-2' : 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-transparent text-gray-400 hover:text-white flex items-center justify-center space-x-2';
             document.getElementById('tab-btn-train').className = tabId === 'tab-train' ? 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-brand-500 text-white flex items-center justify-center space-x-2' : 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-transparent text-gray-400 hover:text-white flex items-center justify-center space-x-2';
             document.getElementById('tab-btn-datasets').className = tabId === 'tab-datasets' ? 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-brand-500 text-white flex items-center justify-center space-x-2' : 'flex-1 py-3 text-sm font-bold text-center border-b-2 border-transparent text-gray-400 hover:text-white flex items-center justify-center space-x-2';
@@ -976,7 +1108,6 @@ HTML_TEMPLATE = """
             fetch('/api/datasets')
                 .then(res => res.json())
                 .then(data => {
-                    // Populate checklist
                     const checklist = document.getElementById('dataset-checklist');
                     checklist.innerHTML = '';
                     
@@ -990,7 +1121,6 @@ HTML_TEMPLATE = """
                         checklist.appendChild(div);
                     });
                     
-                    // Populate raw links list in Tab 3
                     const linksList = document.getElementById('raw-links-list');
                     linksList.innerHTML = '';
                     data.repos.forEach(repo => {
@@ -1000,7 +1130,6 @@ HTML_TEMPLATE = """
                         linksList.appendChild(div);
                     });
                     
-                    // Populate general pre-processing statistics cards
                     const stats = data.stats;
                     if (stats.num_datasets_processed) {
                         document.getElementById('stats-datasets').innerText = stats.num_datasets_processed;
@@ -1008,13 +1137,11 @@ HTML_TEMPLATE = """
                         document.getElementById('stats-tokens').innerText = stats.estimated_token_count.toLocaleString();
                         document.getElementById('stats-dup').innerText = stats.duplicate_rate + "%";
                         
-                        // Ratio calculation
                         const kept = stats.num_samples_kept;
                         const discarded = stats.num_samples_discarded;
                         const ratio = kept / (kept + discarded) * 100;
                         document.getElementById('stats-qc').innerText = ratio.toFixed(1) + "%";
                         
-                        // Populate languages bars
                         const langContainer = document.getElementById('lang-bar-container');
                         langContainer.innerHTML = '';
                         
@@ -1035,7 +1162,6 @@ HTML_TEMPLATE = """
                             langContainer.appendChild(bar);
                         });
                     } else {
-                        // Reset stats to zeroes
                         document.getElementById('stats-datasets').innerText = "0";
                         document.getElementById('stats-size').innerText = "0.00 MB";
                         document.getElementById('stats-tokens').innerText = "0";
@@ -1046,10 +1172,9 @@ HTML_TEMPLATE = """
                 });
         }
 
-        // Add a dataset link to text file
         function addDatasetLink() {
             const input = document.getElementById('new-dataset-url');
-            const url = input.value.strip();
+            const url = input.value.trim();
             if (!url) return;
             
             fetch('/api/add_dataset', {
@@ -1085,7 +1210,6 @@ HTML_TEMPLATE = """
                     });
                 })
                 .catch(() => {
-                    // Inject a placeholder blank/offline grid
                     const grid = document.getElementById('neuron-grid');
                     grid.innerHTML = '';
                     for (let i = 0; i < 64; i++) {
@@ -1099,8 +1223,6 @@ HTML_TEMPLATE = """
         // 5. Training execution
         function startTraining() {
             const steps = document.getElementById('train-steps').value;
-            
-            // Get selected checklist links
             const checkboxes = document.querySelectorAll('#dataset-checklist input[type="checkbox"]:checked');
             const selected_repos = Array.from(checkboxes).map(cb => cb.value);
             
@@ -1152,7 +1274,6 @@ HTML_TEMPLATE = """
                         logBox.innerText = data.logs.join('\\n');
                         logBox.scrollTop = logBox.scrollHeight;
                         
-                        // Update indicators live
                         document.getElementById('metric-epoch').innerText = data.epoch;
                         document.getElementById('metric-step').innerText = data.step;
                         document.getElementById('metric-loss').innerText = data.loss > 0 ? data.loss : "0.0000";
@@ -1194,7 +1315,6 @@ HTML_TEMPLATE = """
             const text = input.value.trim();
             if (!text) return;
             
-            // Append User message
             const feed = document.getElementById('chat-messages');
             
             const userMsg = document.createElement('div');
@@ -1210,7 +1330,6 @@ HTML_TEMPLATE = """
             
             input.value = '';
             
-            // Append temporary AI thinking message
             const thinkingMsg = document.createElement('div');
             thinkingMsg.className = "flex items-start space-x-3";
             thinkingMsg.id = "ai-thinking-placeholder";
@@ -1223,7 +1342,6 @@ HTML_TEMPLATE = """
             feed.appendChild(thinkingMsg);
             feed.scrollTop = feed.scrollHeight;
             
-            // API call to query AI
             fetch('/api/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -1231,7 +1349,6 @@ HTML_TEMPLATE = """
             })
             .then(res => res.json())
             .then(data => {
-                // Remove placeholder
                 document.getElementById('ai-thinking-placeholder').remove();
                 
                 if (data.error) {
@@ -1239,7 +1356,6 @@ HTML_TEMPLATE = """
                     return;
                 }
                 
-                // Append AI Response
                 const aiResponse = document.createElement('div');
                 aiResponse.className = "flex items-start space-x-3";
                 aiResponse.innerHTML = `
@@ -1251,7 +1367,6 @@ HTML_TEMPLATE = """
                 feed.appendChild(aiResponse);
                 feed.scrollTop = feed.scrollHeight;
                 
-                // Populate Alternatives Thoughts (probabilities list)
                 const altBox = document.getElementById('alternatives-box');
                 altBox.innerHTML = '';
                 
@@ -1271,7 +1386,6 @@ HTML_TEMPLATE = """
                     altBox.appendChild(div);
                 });
                 
-                // Fetch neuron states to update visual dots!
                 fetchNeuronStates();
             })
             .catch(() => {

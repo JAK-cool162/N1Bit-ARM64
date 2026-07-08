@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import numpy as np
+from typing import List, Dict
 
 # Add parent directory to path to ensure correct package import
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -72,7 +73,32 @@ def add_new_dataset_url():
         
     print(f"[Success] Appended '{url}' successfully to '{LINKS_FILE}'!")
 
-def load_numpy_model(npz_path: str):
+def load_model_dimensions(model_name: str) -> tuple:
+    """Loads custom dimensions from model_config.json if it exists, otherwise uses defaults."""
+    paths = get_model_paths(model_name)
+    config_path = os.path.join(paths["model_dir"], "model_config.json")
+    
+    # Defaults
+    e_dim = EMBED_DIM
+    n_layers = NUM_LAYERS
+    n_heads = NUM_HEADS
+    s_len = SEQ_LEN
+    
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+            e_dim = cfg.get("embed_dim", EMBED_DIM)
+            n_layers = cfg.get("num_layers", NUM_LAYERS)
+            n_heads = cfg.get("num_heads", NUM_HEADS)
+            s_len = cfg.get("seq_len", SEQ_LEN)
+            print(f"[System] Loaded custom model dimensions from model_config.json (Embed: {e_dim}, Layers: {n_layers})")
+        except Exception:
+            pass
+            
+    return e_dim, n_layers, n_heads, s_len
+
+def load_numpy_model(npz_path: str, model_name: str):
     """Helper to load .npz weights into pure NumPy BitNet model (either Transformer or RNN)."""
     data = np.load(npz_path, allow_pickle=True)
     
@@ -80,10 +106,11 @@ def load_numpy_model(npz_path: str):
     if "model_type" in data:
         model_type = str(data["model_type"])
         
+    # Get configuration dimensions
+    embed_dim, num_layers, num_heads, seq_len = load_model_dimensions(model_name)
+    
     if model_type == "rnn":
         vocab_size = int(data["vocab_size"])
-        embed_dim = int(data["embed_dim"])
-        seq_len = int(data["seq_len"])
         
         model = NumPyBitRNNLM(vocab_size=vocab_size, embed_dim=embed_dim, seq_len=seq_len)
         model.E = data["E"]
@@ -92,11 +119,11 @@ def load_numpy_model(npz_path: str):
         model.W_hy = data["W_hy"]
         model.b_h = data["b_h"]
         model.b_y = data["b_y"]
-        return model, "rnn"
+        return model, "rnn", seq_len
         
     else:
         weights_dict = {
-            "num_heads": int(data["num_heads"]),
+            "num_heads": num_heads,
             "token_embedding": data["token_embedding"],
             "position_embedding": data["position_embedding"],
             "ln_f_w": data["ln_f_w"],
@@ -123,7 +150,7 @@ def load_numpy_model(npz_path: str):
             }
             weights_dict["blocks"].append(block_data)
             
-        return NumPyBitTransformerLM(weights_dict), "transformer"
+        return NumPyBitTransformerLM(weights_dict), "transformer", seq_len
 
 def show_neuron_states(model, is_numpy: bool, model_type: str):
     """Displays neuron binary states."""
@@ -203,6 +230,9 @@ def main():
     print(f"\nActive Named Model: '{model_name}'")
     paths = get_model_paths(model_name)
     
+    # Load custom dimensions for the chosen model if saved
+    embed_dim, num_layers, num_heads, seq_len = load_model_dimensions(model_name)
+    
     tokenizer_exists = os.path.exists(paths["tokenizer"])
     pytorch_checkpoint_exists = os.path.exists(paths["checkpoint"])
     numpy_checkpoint_exists = os.path.exists(paths["numpy_weights"])
@@ -258,16 +288,16 @@ def main():
             print("\n[Loading PyTorch model...]")
             model = BitTransformerLM(
                 vocab_size=len(tokenizer.vocab),
-                embed_dim=EMBED_DIM,
-                num_layers=NUM_LAYERS,
-                num_heads=NUM_HEADS,
-                seq_len=SEQ_LEN
+                embed_dim=embed_dim,
+                num_layers=num_layers,
+                num_heads=num_heads,
+                seq_len=seq_len
             )
             model.load_state_dict(torch.load(paths["checkpoint"], map_location="cpu"))
             model.eval()
             print("[Model loaded on CPU successfully.]")
             
-            run_chat_loop(model, tokenizer, is_numpy=False, model_type="transformer")
+            run_chat_loop(model, tokenizer, is_numpy=False, model_type="transformer", active_seq_len=seq_len)
             
         elif choice == "3":
             if not numpy_checkpoint_exists:
@@ -278,10 +308,10 @@ def main():
             tokenizer.load(paths["tokenizer"])
             
             print("\n[Loading Pure NumPy 1-Bit Model...]")
-            model, model_type = load_numpy_model(paths["numpy_weights"])
+            model, model_type, active_seq_len = load_numpy_model(paths["numpy_weights"], model_name)
             print(f"[Model ({model_type.upper()}) loaded into NumPy engine successfully. Ready for low-power ARM64 inference!]")
             
-            run_chat_loop(model, tokenizer, is_numpy=True, model_type=model_type)
+            run_chat_loop(model, tokenizer, is_numpy=True, model_type=model_type, active_seq_len=active_seq_len)
             
         elif choice == "4":
             add_new_dataset_url()
@@ -296,15 +326,15 @@ def main():
                 tokenizer.load(paths["tokenizer"])
                 model = BitTransformerLM(
                     vocab_size=len(tokenizer.vocab),
-                    embed_dim=EMBED_DIM,
-                    num_layers=NUM_LAYERS,
-                    num_heads=NUM_HEADS,
-                    seq_len=SEQ_LEN
+                    embed_dim=embed_dim,
+                    num_layers=num_layers,
+                    num_heads=num_heads,
+                    seq_len=seq_len
                 )
                 model.load_state_dict(torch.load(paths["checkpoint"], map_location="cpu"))
                 show_neuron_states(model, is_numpy=False, model_type="transformer")
             else:
-                model, model_type = load_numpy_model(paths["numpy_weights"])
+                model, model_type, _ = load_numpy_model(paths["numpy_weights"], model_name)
                 show_neuron_states(model, is_numpy=True, model_type=model_type)
                 
         elif choice == "6":
@@ -350,7 +380,7 @@ def main():
         else:
             print("[Error] Invalid option. Please enter 1-9.")
 
-def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
+def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str, active_seq_len: int):
     """Interactive loop to prompt the 1-bit AI model with optional sandbox execution."""
     global sandbox_active, sandbox_instance
     print("\n" + "-"*50)
@@ -371,7 +401,7 @@ def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
         formatted_prompt = f"<instruction>: {prompt}\n<response>:"
         prompt_ids = tokenizer.encode(formatted_prompt)
         
-        prompt_ids = prompt_ids[-SEQ_LEN+20:]
+        prompt_ids = prompt_ids[-active_seq_len+20:]
         prompt_ids = [tokenizer.bos_id] + prompt_ids
         
         # Thinking Log
@@ -411,7 +441,6 @@ def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
         
         # SANDBOX INTERCEPTION
         if sandbox_active and sandbox_instance is not None:
-            # Check for Python or Bash code blocks
             python_matches = re.findall(r'```python\n(.*?)```', response, re.DOTALL)
             bash_matches = re.findall(r'```(?:bash|sh)\n(.*?)```', response, re.DOTALL)
             
