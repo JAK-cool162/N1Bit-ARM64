@@ -8,7 +8,7 @@ from typing import List, Dict
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from n1bit.config import (
-    LINKS_FILE, CACHE_DIR, STATS_FILE,
+    LINKS_FILE, CACHE_DIR,
     EMBED_DIM, NUM_LAYERS, NUM_HEADS, SEQ_LEN, get_model_paths
 )
 from n1bit.tokenizer import SimpleBPETokenizer

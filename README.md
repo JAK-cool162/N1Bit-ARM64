@@ -90,19 +90,22 @@ python interactive.py
 
 ## 🌋 Enabling Vulkan GPU Acceleration on Phone (Termux)
 
-To accelerate 1-bit LLMs on your mobile GPU, configure Vulkan:
+In standard Termux, GPU and Vulkan packages are not in the main repository, which leads to `Unable to locate package` errors. To enable Vulkan compute, follow these steps:
 
-1. Update packages:
+1. Enable the Termux User Repo (TUR) and X11 repo:
+   ```bash
+   pkg install tur-repo x11-repo -y
+   ```
+2. Update your package lists completely:
    ```bash
    pkg update && pkg upgrade -y
    ```
-2. Install Vulkan loader and Mesa drivers:
+3. Install the Android Vulkan loader bridge, Vulkan tools, and shader compilers:
    ```bash
-   pkg install mesa-vulkan libvulkan -y
+   pkg install vulkan-loader-android vulkan-tools vulkan-headers shaderc -y
    ```
-3. Install and run diagnostic tool:
+4. Verify Vulkan is active on your phone's Adreno/Mali GPU:
    ```bash
-   pkg install vulkan-tools -y
    vulkaninfo
    ```
 *Our 1-bit backend will automatically query Vulkan availability and accelerate matrices on GPU when active.*

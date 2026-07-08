@@ -17,15 +17,12 @@ def is_vulkan_available() -> bool:
         return False
         
     try:
-        # PyTorch check for Vulkan support
         return torch.is_vulkan_available()
     except AttributeError:
         return False
 
 def get_vulkan_device():
-    """
-    Returns PyTorch Vulkan device if available, otherwise falls back.
-    """
+    """Returns PyTorch Vulkan device if available, otherwise falls back."""
     if is_vulkan_available():
         print("[Vulkan] Native Vulkan compute device detected! Accelerating 1-bit operations on GPU.")
         return torch.device("vulkan")
@@ -34,26 +31,30 @@ def get_vulkan_device():
 def get_termux_vulkan_guide() -> str:
     """
     Returns a step-by-step setup guide for enabling Vulkan GPU acceleration 
-    inside Termux on Android devices.
+    inside Termux on Android devices, resolving 'Unable to locate package' errors.
     """
     return """
 ============================================================
        TERMUX VULKAN GPU ACCELERATION SETUP GUIDE
 ============================================================
-To enable Vulkan compute shaders for 1-bit LLMs on your mobile GPU:
+In standard Termux, GPU and Vulkan packages are not in the main repository,
+which leads to 'Unable to locate package' errors.
 
-1. Update Termux packages:
+To enable Vulkan compute on your phone's GPU, follow these steps:
+
+1. Enable the Termux User Repo (TUR) and X11 repo:
+   $ pkg install tur-repo x11-repo -y
+
+2. Update your package lists completely:
    $ pkg update && pkg upgrade -y
 
-2. Install Android Vulkan loader and Mesa drivers:
-   $ pkg install mesa-vulkan libvulkan -y
+3. Install the Android Vulkan loader bridge, Vulkan tools, and shader compilers:
+   $ pkg install vulkan-loader-android vulkan-tools vulkan-headers shaderc -y
 
-3. Verify Vulkan is active on your phone's GPU:
-   $ pkg install vulkan-tools -y
+4. Verify Vulkan is active on your phone's Adreno/Mali GPU:
    $ vulkaninfo
 
-4. Once Vulkan is active, our 1-bit PyTorch backend will 
-   automatically detect the GPU and route all matrix operations 
-   through Vulkan compute shaders!
+5. Once active, our 1-bit backend will automatically query 
+   Vulkan availability and accelerate matrices on GPU!
 ============================================================
 """

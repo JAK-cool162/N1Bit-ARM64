@@ -74,36 +74,29 @@ MODEL_PROFILES = {
 }
 
 def calculate_parameter_count(vocab_size: int, embed_dim: int, num_layers: int, seq_len: int) -> int:
-    """
-    Estimates the exact total number of parameters in the 1-bit Transformer architecture
-    to help users match their hardware's CPU limits and prevent memory crashes.
-    """
-    # Token & Position Embeddings
+    """Estimates total parameters to prevent memory crashes."""
     token_emb = vocab_size * embed_dim
     pos_emb = seq_len * embed_dim
     
-    # Block Layers: Q, K, V Projections + Out Projection + MLP projections + LayerNorms
-    # In each block:
-    # Q_proj, K_proj, V_proj, Out_proj = 4 * (embed_dim * embed_dim)
-    # MLP (gate_proj + down_proj) = embed_dim * (4 * embed_dim) + (4 * embed_dim) * embed_dim = 8 * (embed_dim * embed_dim)
-    # LayerNorms = 2 * (2 * embed_dim)
     params_per_block = 12 * (embed_dim * embed_dim) + (4 * embed_dim)
     total_blocks_params = num_layers * params_per_block
     
-    # Final LayerNorm + LM Head
     final_ln = 2 * embed_dim
     lm_head = embed_dim * vocab_size
     
     return token_emb + pos_emb + total_blocks_params + final_ln + lm_head
 
 def get_model_paths(model_name: str = "default") -> dict:
-    """Dynamically returns isolated cache and file paths for a named model."""
+    """
+    Dynamically returns isolated cache and file paths for a named model.
+    Saves compiled training corpora as pure .txt files for ultra-fast, parse-free load speeds.
+    """
     model_dir = os.path.join(CACHE_DIR, model_name)
     os.makedirs(model_dir, exist_ok=True)
     
     return {
         "model_dir": model_dir,
-        "processed_data": os.path.join(model_dir, "processed_data.jsonl"),
+        "processed_data": os.path.join(model_dir, "processed_data.txt"),  # Superfast pure text format
         "tokenizer": os.path.join(model_dir, "tokenizer.json"),
         "checkpoint": os.path.join(model_dir, "model_checkpoint.pt"),
         "numpy_weights": os.path.join(model_dir, "numpy_weights.npz"),
