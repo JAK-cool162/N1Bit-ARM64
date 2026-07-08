@@ -2,29 +2,47 @@ import os
 import json
 import re
 import random
+import csv
 from typing import Generator, Dict, Any, List
 from .config import LINKS_FILE, PROCESSED_DATA_FILE, STATS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD
 from .utils import compute_hash, score_sample_quality, detect_language
 
+# Check if requests is available, fall back to urllib
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    import urllib.request
+    HAS_REQUESTS = False
+
 try:
     from datasets import load_dataset
-    HAS_DATASETS = True
+    import pyarrow
+    HAS_DATASETS_AND_ARROW = True
 except ImportError:
-    HAS_DATASETS = False
+    HAS_DATASETS_AND_ARROW = False
 
 class DatasetEngine:
     """
     Highly robust and efficient Dataset Engine designed for 1-bit ARM64/Mobile systems.
     Downloads datasets safely, filters, scores quality, removes duplicates, streams
     data, and produces extensive pre-training statistics.
-    Includes a highly realistic offline synthetic fallback generator for sandboxed/restricted environments.
+    
+    Termux-Safe Architecture:
+    - Automatically detects if 'pyarrow' is missing (which is common on ARM64 Termux).
+    - If pyarrow is missing, it skips the heavy 'datasets' library and uses a custom,
+      pure-Python Hugging Face Repository Parser to fetch and parse JSON, JSONL, CSV, and TXT
+      files directly using standard web APIs.
+    - Includes a highly realistic offline synthetic fallback generator for sandboxed/restricted environments.
     """
     def __init__(self):
         self.links_file = LINKS_FILE
         self.processed_data_file = PROCESSED_DATA_FILE
         self.stats_file = STATS_FILE
+        self.raw_cache_dir = os.path.join("cache", "raw_files")
+        os.makedirs(self.raw_cache_dir, exist_ok=True)
         
-        # In-memory tracking for statistics (cleared on fresh runs)
+        # In-memory tracking for statistics
         self.stats = {
             "num_datasets_processed": 0,
             "num_files_processed": 0,
@@ -60,6 +78,36 @@ class DatasetEngine:
         if len(parts) >= 2:
             return "/".join(parts[-2:])
         return url
+
+    def fetch_web_json(self, url: str) -> Any:
+        """Helper to fetch JSON from web in pure Python without extra dependencies."""
+        if HAS_REQUESTS:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        else:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                return json.loads(response.read().decode('utf-8'))
+
+    def download_web_file(self, url: str, dest_path: str):
+        """Helper to download a file from the web safely with resume capability."""
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        
+        # Check if file exists to resume/skip download
+        if os.path.exists(dest_path):
+            return
+            
+        if HAS_REQUESTS:
+            response = requests.get(url, stream=True, timeout=15)
+            response.raise_for_status()
+            with open(dest_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        else:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                with open(dest_path, 'wb') as f:
+                    f.write(response.read())
 
     def detect_dataset_type(self, sample: Dict[str, Any]) -> str:
         """
@@ -139,18 +187,82 @@ class DatasetEngine:
                 text_parts.append(v)
         return "\n".join(text_parts)
 
+    def fetch_hf_repo_files_pure_python(self, repo_id: str) -> List[Dict[str, Any]]:
+        """
+        Pure-Python fallback to stream and parse Hugging Face dataset files
+        without PyArrow or standard Hugging Face datasets library.
+        Queries the Hugging Face Web API to get repository file trees and downloads text formats.
+        """
+        samples = []
+        try:
+            # Query file list from Hugging Face datasets repository API
+            api_url = f"https://huggingface.co/api/datasets/{repo_id}/tree/main"
+            file_tree = self.fetch_web_json(api_url)
+            
+            # Filter files with readable text formats: json, jsonl, csv, txt
+            text_files = []
+            for item in file_tree:
+                if item.get("type") == "file":
+                    path = item.get("path", "")
+                    if path.endswith((".json", ".jsonl", ".csv", ".txt")):
+                        text_files.append(path)
+                        
+            # Loop through first 2 found text files to avoid extreme download bloat
+            for file_path in text_files[:2]:
+                local_dest = os.path.join(self.raw_cache_dir, repo_id, file_path)
+                download_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main/{file_path}"
+                
+                # Download and cache raw file
+                self.download_web_file(download_url, local_dest)
+                
+                # Parse depending on format
+                if file_path.endswith(".jsonl"):
+                    with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if line.strip():
+                                samples.append(json.loads(line))
+                                if len(samples) >= 100:  # limit samples per file for mobile
+                                    break
+                elif file_path.endswith(".json"):
+                    with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            samples.extend(data[:100])
+                        elif isinstance(data, dict):
+                            # Check if split by columns or rows
+                            for key in ["train", "data", "rows"]:
+                                if key in data and isinstance(data[key], list):
+                                    samples.extend(data[key][:100])
+                                    break
+                            else:
+                                samples.append(data)
+                elif file_path.endswith(".csv"):
+                    with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
+                        reader = csv.DictReader(f)
+                        for row in reader:
+                            samples.append(dict(row))
+                            if len(samples) >= 100:
+                                break
+                elif file_path.endswith(".txt"):
+                    with open(local_dest, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if len(line.strip()) > 10:
+                                samples.append({"text": line.strip()})
+                                if len(samples) >= 100:
+                                    break
+        except Exception as e:
+            # Silence web/connection errors, we will fallback to synthetic generator
+            pass
+            
+        return samples
+
     def generate_mock_samples(self, repo_id: str, count: int = 15) -> List[Dict[str, Any]]:
         """
         Generates rich, domain-specific mock/synthetic dataset samples when offline.
-        Maintains structural integrity and provides authentic multilingual stop-words
-        and domain terms for 1-bit ARM64, Minecraft, Coding, Physics, and Chat topics.
         """
         samples = []
-        
-        # Determine domain from repo_id
         repo_id_lower = repo_id.lower()
         
-        # Templates based on domain
         if "physics" in repo_id_lower or "chemistry" in repo_id_lower or "climate" in repo_id_lower:
             topics = [
                 ("What is gravity?", "Gravity is a fundamental physical force that attracts objects with mass towards each other."),
@@ -216,7 +328,6 @@ class DatasetEngine:
                 samples.append({"image_caption": f"{random.choice(captions)} Graphic design {i}.", "pixel_values": [1, 2, 3]})
                 
         else:
-            # Default SFT instruction templates
             instructions = [
                 ("What is a 1-bit neural network?", "A 1-bit neural network uses binary weights (typically -1 and +1) or ternary weights to dramatically reduce computation, power, and storage requirements on mobile devices."),
                 ("How do we optimize LLMs for ARM64 architecture?", "By avoiding heavy dependencies like transformers, using lightweight custom tokenizers, and utilizing integer or 1-bit math that maps perfectly to neon instruction sets."),
@@ -236,7 +347,7 @@ class DatasetEngine:
         """
         Downloads all datasets from links.txt, processes, de-duplicates,
         filters by quality, and writes to a single reusable cache file.
-        Uses streaming with a fallback to highly realistic mock generation when offline.
+        Uses streaming or custom PyArrow-free web parsing with a mock fallback.
         """
         if not force_refresh and os.path.exists(self.processed_data_file) and os.path.exists(self.stats_file):
             print(f"[DatasetEngine] Found cached processed data at {self.processed_data_file}. Skipping preprocessing.")
@@ -261,7 +372,6 @@ class DatasetEngine:
         size_before_bytes = 0
         size_after_bytes = 0
 
-        # Open the output cache file
         os.makedirs(os.path.dirname(self.processed_data_file), exist_ok=True)
         
         with open(self.processed_data_file, "w", encoding="utf-8") as out_f:
@@ -270,105 +380,81 @@ class DatasetEngine:
                 num_datasets_processed += 1
                 
                 print(f"[DatasetEngine] Safe loading: '{repo_id}'...")
-                loaded_from_hf = False
+                loaded_samples = []
+                loaded_source = "None"
                 
-                # Try to load from HF datasets
-                if HAS_DATASETS:
+                # 1. Try PyArrow-dependent streaming if available (e.g. PC/x86 environment)
+                if HAS_DATASETS_AND_ARROW:
                     try:
                         dataset = load_dataset(repo_id, streaming=True)
                         splits = list(dataset.keys()) if hasattr(dataset, "keys") else ["train"]
-                        
                         for split in splits:
                             num_files_processed += 1
                             split_dataset = dataset[split]
-                            
                             count = 0
                             for raw_sample in split_dataset:
                                 if count >= MAX_SAMPLES_PER_DATASET:
                                     break
-                                
-                                total_samples_processed += 1
+                                loaded_samples.append(raw_sample)
                                 count += 1
-                                
-                                raw_str_size = sum(len(str(v)) for v in raw_sample.values())
-                                size_before_bytes += raw_str_size
-                                
-                                ds_type = self.detect_dataset_type(raw_sample)
-                                unified_text = self.convert_to_unified_text(raw_sample, ds_type).strip()
-                                
-                                if not unified_text:
-                                    num_samples_discarded += 1
-                                    continue
-                                    
-                                quality_score = score_sample_quality(unified_text)
-                                if quality_score < SAMPLE_QUALITY_THRESHOLD:
-                                    num_samples_discarded += 1
-                                    continue
-                                    
-                                sample_hash = compute_hash(unified_text)
-                                if sample_hash in seen_hashes:
-                                    total_duplicates += 1
-                                    num_samples_discarded += 1
-                                    continue
-                                    
-                                seen_hashes.add(sample_hash)
-                                
-                                lang = detect_language(unified_text)
-                                lang_distribution[lang] = lang_distribution.get(lang, 0) + 1
-                                
-                                num_samples_kept += 1
-                                size_after_bytes += len(unified_text)
-                                
-                                out_f.write(json.dumps({"text": unified_text}) + "\n")
-                                
-                        print(f"[DatasetEngine] Success: Loaded '{repo_id}' from Hugging Face.")
-                        loaded_from_hf = True
-                    except Exception as e:
-                        # Log error, we will use mock fallback below
+                        loaded_source = "HuggingFace Datasets API"
+                    except Exception:
                         pass
                 
-                # Offline Fallback Generator
-                if not loaded_from_hf:
+                # 2. If pyarrow/datasets are absent (e.g. Termux), download and parse JSON/CSV files directly
+                if not loaded_samples:
+                    try:
+                        loaded_samples = self.fetch_hf_repo_files_pure_python(repo_id)
+                        if loaded_samples:
+                            num_files_processed += len(loaded_samples) // 100 + 1
+                            loaded_source = "Pure-Python HF Repository Parser"
+                    except Exception:
+                        pass
+                        
+                # 3. Fall back to offline synthetic generator if blocked or empty
+                if not loaded_samples:
                     num_files_processed += 1
-                    mock_samples = self.generate_mock_samples(repo_id, count=15)
+                    loaded_samples = self.generate_mock_samples(repo_id, count=15)
+                    loaded_source = "Offline-Safety Synthetic Fallback"
+                
+                # Process collected samples
+                count = 0
+                for raw_sample in loaded_samples:
+                    total_samples_processed += 1
+                    count += 1
                     
-                    count = 0
-                    for raw_sample in mock_samples:
-                        total_samples_processed += 1
-                        count += 1
+                    raw_str_size = sum(len(str(v)) for v in raw_sample.values())
+                    size_before_bytes += raw_str_size
+                    
+                    ds_type = self.detect_dataset_type(raw_sample)
+                    unified_text = self.convert_to_unified_text(raw_sample, ds_type).strip()
+                    
+                    if not unified_text:
+                        num_samples_discarded += 1
+                        continue
                         
-                        raw_str_size = sum(len(str(v)) for v in raw_sample.values())
-                        size_before_bytes += raw_str_size
+                    quality_score = score_sample_quality(unified_text)
+                    if quality_score < SAMPLE_QUALITY_THRESHOLD:
+                        num_samples_discarded += 1
+                        continue
                         
-                        ds_type = self.detect_dataset_type(raw_sample)
-                        unified_text = self.convert_to_unified_text(raw_sample, ds_type).strip()
+                    sample_hash = compute_hash(unified_text)
+                    if sample_hash in seen_hashes:
+                        total_duplicates += 1
+                        num_samples_discarded += 1
+                        continue
                         
-                        if not unified_text:
-                            num_samples_discarded += 1
-                            continue
-                            
-                        quality_score = score_sample_quality(unified_text)
-                        if quality_score < SAMPLE_QUALITY_THRESHOLD:
-                            num_samples_discarded += 1
-                            continue
-                            
-                        sample_hash = compute_hash(unified_text)
-                        if sample_hash in seen_hashes:
-                            total_duplicates += 1
-                            num_samples_discarded += 1
-                            continue
-                            
-                        seen_hashes.add(sample_hash)
-                        
-                        lang = detect_language(unified_text)
-                        lang_distribution[lang] = lang_distribution.get(lang, 0) + 1
-                        
-                        num_samples_kept += 1
-                        size_after_bytes += len(unified_text)
-                        
-                        out_f.write(json.dumps({"text": unified_text}) + "\n")
-                        
-                    print(f"[DatasetEngine] Loaded '{repo_id}' successfully using offline-safety generator.")
+                    seen_hashes.add(sample_hash)
+                    
+                    lang = detect_language(unified_text)
+                    lang_distribution[lang] = lang_distribution.get(lang, 0) + 1
+                    
+                    num_samples_kept += 1
+                    size_after_bytes += len(unified_text)
+                    
+                    out_f.write(json.dumps({"text": unified_text}) + "\n")
+                    
+                print(f"[DatasetEngine] Success: Loaded '{repo_id}' via {loaded_source} ({count} samples).")
 
         # Save and calculate final statistics
         dup_rate = (total_duplicates / max(1, total_samples_processed)) * 100
