@@ -1,0 +1,39 @@
+#version 450
+
+layout(local_size_x = 256) in;
+
+// Input Activation Buffer (Full Precision or 16-bit)
+layout(std430, binding = 0) readonly buffer InputBuffer {
+    float x[];
+};
+
+// 1-Bit Weight Buffer (stored as sign values: -1 or +1)
+layout(std430, binding = 1) readonly buffer WeightBuffer {
+    float w[]; 
+};
+
+// Output Projection Buffer
+layout(std430, binding = 2) writeonly buffer OutputBuffer {
+    float out_val[];
+};
+
+// Push Constants for dynamic dimensions
+layout(push_constant) uniform Params {
+    int in_features;
+    int out_features;
+} params;
+
+void main() {
+    uint g_idx = gl_GlobalInvocationID.x;
+    if (g_idx >= uint(params.out_features)) return;
+    
+    float sum = 0.0;
+    int weight_offset = int(g_idx) * params.in_features;
+    
+    // Per-token dot product compute loop executed entirely on GPU
+    for (int i = 0; i < params.in_features; ++i) {
+        sum += x[i] * w[weight_offset + i];
+    }
+    
+    out_val[g_idx] = sum;
+}

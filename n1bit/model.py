@@ -16,6 +16,7 @@ except ImportError:
     nn = nn_stub()
 
 from .config import QUANT_TYPE, USE_16BIT
+from .vulkan_dispatch import VulkanDispatcher
 
 # Helper function to get correct numpy float dtype
 def get_np_dtype():
@@ -54,20 +55,17 @@ if HAS_TORCH:
             weight = self.weight.to(dtype)
             
             # Q1 Quantization: Binary weight quantization to {-1, +1}
-            # scale = mean(|W|)
             scale = torch.mean(torch.abs(weight))
             scale = torch.clamp(scale, min=1e-3)
             
             w_q = torch.sign(weight)
-            # Handle zeros (make them +1)
             w_q[w_q == 0] = 1.0
             
             # STE formulation
             w_final = weight + (w_q * scale - weight).detach()
 
-            # Dynamic 8-bit activation quantization for speed (FP16 overflow protected)
+            # Dynamic 8-bit activation quantization for speed
             max_x = torch.max(torch.abs(x))
-            # Compute scaling factor in FP32 to avoid overflow, then clamp
             scale_factor = 127.0 / torch.clamp(max_x, min=1e-3).float()
             scale_factor = torch.clamp(scale_factor, max=5000.0).to(dtype)
             
@@ -203,7 +201,7 @@ if HAS_TORCH:
 
 
 # =====================================================================
-# PURE NUMPY 1-BIT TRANSFORMR DEPLOYMENT (FP16 Q1 Optimized)
+# PURE NUMPY 1-BIT TRANSFORMR DEPLOYMENT (Vulkan GPU Accelerated)
 # =====================================================================
 
 class NumPyBitLinear:
@@ -211,6 +209,9 @@ class NumPyBitLinear:
         dtype = get_np_dtype()
         self.weight = weight.astype(dtype)
         self.bias = bias.astype(dtype) if bias is not None else None
+        
+        # Initialize native Vulkan ctypes dispatcher for GPU hot paths!
+        self.vulkan = VulkanDispatcher()
         
         # Q1 Quantization: Binary Weight quantization
         mean_abs_w = np.mean(np.abs(self.weight))
@@ -228,7 +229,13 @@ class NumPyBitLinear:
         x_quant = np.clip(np.round(x * scale_factor), -128.0, 127.0) / scale_factor
         x_quant = x_quant.astype(get_np_dtype())
         
-        out = np.dot(x_quant, self.w_quant.T)
+        # Dispatch the computationally heavy dot product to the GPU via Vulkan!
+        # Zero Python loop overhead on the GPU side.
+        if len(x_quant.shape) <= 2:
+            out = self.vulkan.run_matmul(x_quant, self.w_quant)
+        else:
+            out = np.dot(x_quant, self.w_quant.T)
+            
         if self.bias is not None:
             out += self.bias
         return out
@@ -367,6 +374,7 @@ class NumPyBitTransformerLM:
 class NumPyBitRNNLM:
     """
     Pure NumPy 1-Bit Recurrent Language Model optimized with Q1 binary quantization and FP16 half precision.
+    Uses native Vulkan ctypes shader dispatch on GPU hot paths.
     """
     def __init__(self, vocab_size: int, embed_dim: int, seq_len: int):
         self.vocab_size = vocab_size
@@ -375,6 +383,8 @@ class NumPyBitRNNLM:
         self.hidden_dim = embed_dim
         
         dtype = get_np_dtype()
+        self.vulkan = VulkanDispatcher()
+        
         self.E = (np.random.randn(vocab_size, embed_dim) * 0.05).astype(dtype)
         self.W_xh = (np.random.randn(self.hidden_dim, embed_dim) * 0.05).astype(dtype)
         self.W_hh = (np.random.randn(self.hidden_dim, self.hidden_dim) * 0.05).astype(dtype)
@@ -434,10 +444,14 @@ class NumPyBitRNNLM:
         for t in range(seq_len):
             x_emb[t] = self.q_activation(self.E[X[t]].T).astype(dtype)
             
-            a[t] = np.dot(W_xh_f, x_emb[t]) + np.dot(W_hh_f, h[t-1]) + self.b_h
+            # Accelerating compute projection via native Vulkan dispatch (ctypes + SPIR-V)!
+            proj_xh = self.vulkan.run_matmul(x_emb[t], W_xh_f)
+            proj_hh = self.vulkan.run_matmul(h[t-1], W_hh_f)
+            
+            a[t] = proj_xh.reshape(-1, batch_size) + proj_hh.reshape(-1, batch_size) + self.b_h
             h[t] = np.tanh(a[t]).astype(dtype)
             
-            logits_t = np.dot(W_hy_f, h[t]) + self.b_y
+            logits_t = self.vulkan.run_matmul(h[t], W_hy_f).reshape(-1, batch_size) + self.b_y
             
             max_logits = np.max(logits_t, axis=0, keepdims=True)
             exp_logits = np.exp((logits_t - max_logits).astype(np.float32))
@@ -463,21 +477,22 @@ class NumPyBitRNNLM:
             dy /= (batch_size * seq_len)
             dy = dy.astype(dtype)
             
-            dW_hy += np.dot(dy, h[t].T)
+            # Vulkan dispatch for backprop projections!
+            dW_hy += self.vulkan.run_matmul(h[t], dy.T).T
             db_y += np.sum(dy, axis=1, keepdims=True)
             
-            dh = np.dot(W_hy_f.T, dy) + dh_next
+            dh = self.vulkan.run_matmul(dy.T, W_hy_f).T + dh_next
             da = (dh * (1.0 - h[t]**2)).astype(dtype)
             
-            dW_xh += np.dot(da, x_emb[t].T)
-            dW_hh += np.dot(da, h[t-1].T)
+            dW_xh += self.vulkan.run_matmul(x_emb[t], da.T).T
+            dW_hh += self.vulkan.run_matmul(h[t-1], da.T).T
             db_h += np.sum(da, axis=1, keepdims=True)
             
-            dx = np.dot(W_xh_f.T, da)
+            dx = self.vulkan.run_matmul(da.T, W_xh_f).T
             for b in range(batch_size):
                 dE[X[t, b]] += dx[:, b]
                 
-            dh_next = np.dot(W_hh_f.T, da)
+            dh_next = self.vulkan.run_matmul(da.T, W_hh_f).T
             
         self.t += 1
         eps = 1e-4 if dtype == np.float16 else 1e-8
@@ -515,13 +530,13 @@ class NumPyBitRNNLM:
         
         for p_id in input_ids:
             x_t = self.q_activation(self.E[p_id].reshape(-1, 1)).astype(dtype)
-            h_prev = np.tanh(np.dot(W_xh_f, x_t) + np.dot(W_hh_f, h_prev) + self.b_h).astype(dtype)
+            h_prev = np.tanh(self.vulkan.run_matmul(x_t.T, W_xh_f.T).T + self.vulkan.run_matmul(h_prev.T, W_hh_f.T).T + self.b_h).astype(dtype)
             
         for _ in range(max_new_tokens):
             x_t = self.q_activation(self.E[input_ids[-1]].reshape(-1, 1)).astype(dtype)
-            h_prev = np.tanh(np.dot(W_xh_f, x_t) + np.dot(W_hh_f, h_prev) + self.b_h).astype(dtype)
+            h_prev = np.tanh(self.vulkan.run_matmul(x_t.T, W_xh_f.T).T + self.vulkan.run_matmul(h_prev.T, W_hh_f.T).T + self.b_h).astype(dtype)
             
-            logits = np.dot(W_hy_f, h_prev) + self.b_y
+            logits = self.vulkan.run_matmul(h_prev.T, W_hy_f.T).T + self.b_y
             logits = logits.flatten().astype(np.float32) / max(temperature, 1e-5)
             
             exp_logits = np.exp(logits - np.max(logits))
@@ -534,3 +549,6 @@ class NumPyBitRNNLM:
                 break
                 
         return input_ids
+stream_processed_samples = None
+NumPyBitLinear.forward = NumPyBitLinear.forward
+NumPyBitRNNLM.train_step = NumPyBitRNNLM.train_step
