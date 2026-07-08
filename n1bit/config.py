@@ -89,14 +89,15 @@ def calculate_parameter_count(vocab_size: int, embed_dim: int, num_layers: int, 
 def get_model_paths(model_name: str = "default") -> dict:
     """
     Dynamically returns isolated cache and file paths for a named model.
-    Saves compiled training corpora as pure .txt files for ultra-fast, parse-free load speeds.
+    Saves compiled training corpora as high-performance pre-tokenized .bin files
+    (uint16 integers) to achieve the absolute fastest load times and bypass tokenizer overhead.
     """
     model_dir = os.path.join(CACHE_DIR, model_name)
     os.makedirs(model_dir, exist_ok=True)
     
     return {
         "model_dir": model_dir,
-        "processed_data": os.path.join(model_dir, "processed_data.txt"),  # Superfast pure text format
+        "processed_data": os.path.join(model_dir, "processed_data.bin"),  # Pre-tokenized binary format
         "tokenizer": os.path.join(model_dir, "tokenizer.json"),
         "checkpoint": os.path.join(model_dir, "model_checkpoint.pt"),
         "numpy_weights": os.path.join(model_dir, "numpy_weights.npz"),

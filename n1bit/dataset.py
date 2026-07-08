@@ -3,9 +3,11 @@ import json
 import re
 import random
 import csv
+import array
 from typing import Generator, Dict, Any, List
 from .config import LINKS_FILE, MAX_SAMPLES_PER_DATASET, SAMPLE_QUALITY_THRESHOLD, RAW_DOWNLOADS_DIR
 from .utils import compute_hash, score_sample_quality, detect_language
+from .tokenizer import SimpleBPETokenizer
 
 try:
     import requests
@@ -28,15 +30,17 @@ class DatasetEngine:
     data, and produces extensive pre-training statistics.
     Saves all downloaded raw files inside 'downloads/' in the repository.
     
-    Fast Pure-Text Cache:
-    - Compiles all pre-processed text, image captions, and tables into a single
-      raw text file (processed_data.txt) separated by special tokens.
-    - Bypasses slow line-by-line JSON loads, speeding up training loads by up to 10x!
+    Pre-Tokenized Binary Cache (.bin):
+    - Compiles all pre-processed text, image captions, and science tables into a 
+      flat binary array of uint16 integers (processed_data.bin) using the BPE Tokenizer.
+    - Completely eliminates tokenizer overhead during the training loop.
+    - Training becomes blazing fast—reading pre-tokenized chunks in milliseconds!
     """
-    def __init__(self, processed_data_file: str, stats_file: str):
+    def __init__(self, processed_data_file: str, stats_file: str, tokenizer_file: str = None):
         self.links_file = LINKS_FILE
         self.processed_data_file = processed_data_file
         self.stats_file = stats_file
+        self.tokenizer_file = tokenizer_file
         self.raw_cache_dir = RAW_DOWNLOADS_DIR
         os.makedirs(self.raw_cache_dir, exist_ok=True)
         
@@ -125,22 +129,18 @@ class DatasetEngine:
         if len(qa_keys.intersection(keys)) >= 2:
             return "QA"
             
-        # Code/Assembly/Opcodes
         code_keys = {"code", "programming_language", "solution", "test_cases", "assembly", "binary", "hex", "mnemonic", "opcodes"}
         if len(code_keys.intersection(keys)) >= 2:
             return "CodeAssembly"
             
-        # Images/Textures
         img_keys = {"image", "caption", "image_caption", "pixel_values", "textures", "texture", "normal_map"}
         if len(img_keys.intersection(keys)) >= 1:
             return "ImageCaption"
             
-        # Minecraft structures
         mc_keys = {"blocks", "schematic", "minecraft", "structure"}
         if len(mc_keys.intersection(keys)) >= 1:
             return "MinecraftSchematic"
             
-        # Science physics/chemistry tables
         table_keys = {"element", "property", "formula", "compound", "temperature", "pressure", "value"}
         if len(table_keys.intersection(keys)) >= 2:
             return "ScientificTable"
@@ -374,11 +374,12 @@ class DatasetEngine:
 
     def process_all_datasets(self, force_refresh: bool = False, selected_repos: List[str] = None):
         """
-        Downloads datasets, processes, de-duplicates, and quality filters.
-        Compiles and writes clean samples into a fast, parse-free .txt format.
+        Downloads datasets, filters by quality, and tokenizes them immediately.
+        Saves all training corpora as pre-tokenized binary files (.bin) containing
+        unsigned 16-bit integers (uint16) using the BPE tokenizer.
         """
         if not force_refresh and os.path.exists(self.processed_data_file) and os.path.exists(self.stats_file):
-            print(f"[DatasetEngine] Found cached processed data at {self.processed_data_file}. Skipping preprocessing.")
+            print(f"[DatasetEngine] Found cached pre-tokenized binary data at {self.processed_data_file}. Skipping.")
             with open(self.stats_file, 'r') as f:
                 self.stats = json.load(f)
             return
@@ -400,98 +401,124 @@ class DatasetEngine:
         size_before_bytes = 0
         size_after_bytes = 0
 
-        os.makedirs(os.path.dirname(self.processed_data_file), exist_ok=True)
-        
-        with open(self.processed_data_file, "w", encoding="utf-8") as out_f:
-            for url in urls:
-                repo_id = self.parse_repo_id(url)
+        # Collect clean text samples in memory first to train tokenizer
+        clean_text_samples = []
+
+        for url in urls:
+            repo_id = self.parse_repo_id(url)
+            
+            if selected_repos is not None and repo_id not in selected_repos:
+                continue
                 
-                if selected_repos is not None and repo_id not in selected_repos:
+            num_datasets_processed += 1
+            print(f"[DatasetEngine] Safe loading: '{repo_id}'...")
+            loaded_samples = []
+            loaded_source = "None"
+            
+            if self.datasets_api_active:
+                try:
+                    dataset = load_dataset(repo_id, streaming=True)
+                    splits = list(dataset.keys()) if hasattr(dataset, "keys") else ["train"]
+                    for split in splits:
+                        num_files_processed += 1
+                        split_dataset = dataset[split]
+                        count = 0
+                        for raw_sample in split_dataset:
+                            if count >= MAX_SAMPLES_PER_DATASET:
+                                break
+                            loaded_samples.append(raw_sample)
+                            count += 1
+                    loaded_source = "HuggingFace Datasets API"
+                except Exception as e:
+                    err_str = str(e)
+                    if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
+                        print("[DatasetEngine] Connection issues detected. Disabling slow HF Datasets API.")
+                        self.datasets_api_active = False
+            
+            if not loaded_samples and self.pure_python_api_active:
+                try:
+                    loaded_samples = self.fetch_hf_repo_files_pure_python(repo_id)
+                    if loaded_samples:
+                        num_files_processed += len(loaded_samples) // 100 + 1
+                        loaded_source = "Pure-Python HF Repository Parser"
+                except Exception as e:
+                    err_str = str(e)
+                    if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
+                        print("[DatasetEngine] Connection issues detected. Disabling pure-python web loader.")
+                        self.pure_python_api_active = False
+                    
+            if not loaded_samples:
+                num_files_processed += 1
+                loaded_samples = self.generate_mock_samples(repo_id, count=15)
+                loaded_source = "Offline-Safety Synthetic Fallback"
+            
+            count = 0
+            for raw_sample in loaded_samples:
+                total_samples_processed += 1
+                count += 1
+                
+                raw_str_size = sum(len(str(v)) for v in raw_sample.values())
+                size_before_bytes += raw_str_size
+                
+                ds_type = self.detect_dataset_type(raw_sample)
+                unified_text = self.convert_to_unified_text(raw_sample, ds_type).strip()
+                
+                if not unified_text:
+                    num_samples_discarded += 1
                     continue
                     
-                num_datasets_processed += 1
-                print(f"[DatasetEngine] Safe loading: '{repo_id}'...")
-                loaded_samples = []
-                loaded_source = "None"
+                quality_score = score_sample_quality(unified_text)
+                if quality_score < SAMPLE_QUALITY_THRESHOLD:
+                    num_samples_discarded += 1
+                    continue
+                    
+                sample_hash = compute_hash(unified_text)
+                if sample_hash in seen_hashes:
+                    total_duplicates += 1
+                    num_samples_discarded += 1
+                    continue
+                    
+                seen_hashes.add(sample_hash)
                 
-                if self.datasets_api_active:
-                    try:
-                        dataset = load_dataset(repo_id, streaming=True)
-                        splits = list(dataset.keys()) if hasattr(dataset, "keys") else ["train"]
-                        for split in splits:
-                            num_files_processed += 1
-                            split_dataset = dataset[split]
-                            count = 0
-                            for raw_sample in split_dataset:
-                                if count >= MAX_SAMPLES_PER_DATASET:
-                                    break
-                                loaded_samples.append(raw_sample)
-                                count += 1
-                        loaded_source = "HuggingFace Datasets API"
-                    except Exception as e:
-                        err_str = str(e)
-                        if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
-                            print("[DatasetEngine] Connection issues detected. Disabling slow HF Datasets API.")
-                            self.datasets_api_active = False
+                lang = detect_language(unified_text)
+                lang_distribution[lang] = lang_distribution.get(lang, 0) + 1
                 
-                if not loaded_samples and self.pure_python_api_active:
-                    try:
-                        loaded_samples = self.fetch_hf_repo_files_pure_python(repo_id)
-                        if loaded_samples:
-                            num_files_processed += len(loaded_samples) // 100 + 1
-                            loaded_source = "Pure-Python HF Repository Parser"
-                    except Exception as e:
-                        err_str = str(e)
-                        if "SSLError" in err_str or "ConnectionError" in err_str or "TLS" in err_str or "EOF" in err_str:
-                            print("[DatasetEngine] Connection issues detected. Disabling pure-python web loader.")
-                            self.pure_python_api_active = False
-                        
-                if not loaded_samples:
-                    num_files_processed += 1
-                    loaded_samples = self.generate_mock_samples(repo_id, count=15)
-                    loaded_source = "Offline-Safety Synthetic Fallback"
+                num_samples_kept += 1
+                size_after_bytes += len(unified_text)
                 
-                count = 0
-                for raw_sample in loaded_samples:
-                    total_samples_processed += 1
-                    count += 1
-                    
-                    raw_str_size = sum(len(str(v)) for v in raw_sample.values())
-                    size_before_bytes += raw_str_size
-                    
-                    ds_type = self.detect_dataset_type(raw_sample)
-                    unified_text = self.convert_to_unified_text(raw_sample, ds_type).strip()
-                    
-                    if not unified_text:
-                        num_samples_discarded += 1
-                        continue
-                        
-                    quality_score = score_sample_quality(unified_text)
-                    if quality_score < SAMPLE_QUALITY_THRESHOLD:
-                        num_samples_discarded += 1
-                        continue
-                        
-                    sample_hash = compute_hash(unified_text)
-                    if sample_hash in seen_hashes:
-                        total_duplicates += 1
-                        num_samples_discarded += 1
-                        continue
-                        
-                    seen_hashes.add(sample_hash)
-                    
-                    lang = detect_language(unified_text)
-                    lang_distribution[lang] = lang_distribution.get(lang, 0) + 1
-                    
-                    num_samples_kept += 1
-                    size_after_bytes += len(unified_text)
-                    
-                    # Write clean sample text directly separated by a special token
-                    out_f.write(unified_text + "\n</s>\n")
-                    
-                print(f"[DatasetEngine] Success: Loaded '{repo_id}' via {loaded_source} ({count} samples).")
+                clean_text_samples.append(unified_text)
+                
+            print(f"[DatasetEngine] Success: Loaded '{repo_id}' via {loaded_source} ({count} samples).")
 
+        # 2. Train or Load BPE Tokenizer inside dataset engine
+        tokenizer = SimpleBPETokenizer(vocab_size=4000)
+        if self.tokenizer_file and os.path.exists(self.tokenizer_file):
+            tokenizer.load(self.tokenizer_file)
+        else:
+            print("[DatasetEngine] Tokenizer file not found. Training tokenizer first...")
+            tokenizer.train_from_texts(clean_text_samples[:1000])
+            if self.tokenizer_file:
+                tokenizer.save(self.tokenizer_file)
+
+        # 3. Tokenize all clean texts to a flat uint16 array and save as .bin
+        print(f"[DatasetEngine] Tokenizing clean samples directly to high-performance .bin cache...")
+        token_ids_array = []
+        for text in clean_text_samples:
+            # Wrap with BOS/EOS
+            tokens = [tokenizer.bos_id] + tokenizer.encode(text) + [tokenizer.eos_id]
+            token_ids_array.extend(tokens)
+            
+        # Write flat list of integers to binary file using 'H' (unsigned 16-bit short)
+        bin_data = array.array('H', token_ids_array)
+        os.makedirs(os.path.dirname(self.processed_data_file), exist_ok=True)
+        with open(self.processed_data_file, "wb") as f:
+            bin_data.tofile(f)
+            
+        print(f"[DatasetEngine] Binary cache compiled successfully! Saved {len(token_ids_array):,} tokens to '{self.processed_data_file}'")
+
+        # Save stats
         dup_rate = (total_duplicates / max(1, total_samples_processed)) * 100
-        estimated_token_count = int(size_after_bytes / 4)
+        estimated_token_count = len(token_ids_array)
         
         self.stats = {
             "num_datasets_processed": num_datasets_processed,
@@ -501,7 +528,7 @@ class DatasetEngine:
             "duplicate_rate": round(dup_rate, 2),
             "language_distribution": lang_distribution,
             "size_before_bytes": size_before_bytes,
-            "size_after_bytes": size_after_bytes,
+            "size_after_bytes": os.path.getsize(self.processed_data_file), # actual binary file size
             "estimated_token_count": estimated_token_count
         }
         
@@ -524,19 +551,26 @@ class DatasetEngine:
         print(f"Duplicate Rate:            {s['duplicate_rate']}%")
         print(f"Language Distribution:     {s['language_distribution']}")
         print(f"Size Before Cleaning:      {s['size_before_bytes'] / (1024*1024):.2f} MB")
-        print(f"Size After Cleaning:       {s['size_after_bytes'] / (1024*1024):.2f} MB")
-        print(f"Estimated Token Count:     {s['estimated_token_count']}")
+        print(f"Size After Cleaning (Bin): {s['size_after_bytes'] / (1024*1024):.2f} MB")
+        print(f"Estimated Token Count:     {s['estimated_token_count']:,} tokens")
         print("="*50 + "\n")
 
-    def stream_processed_samples(self) -> Generator[Dict[str, str], None, None]:
-        """Streams preprocessed samples separated by special tokens instantly with 0 JSON overhead."""
+    def stream_processed_tokens(self) -> Generator[int, None, None]:
+        """
+        Streams pre-tokenized integers directly from the binary cache file (.bin).
+        Loads file in small binary chunks, bypassing 100% of text tokenization overhead.
+        """
         if not os.path.exists(self.processed_data_file):
             self.process_all_datasets()
             
-        with open(self.processed_data_file, "r", encoding="utf-8") as f:
-            content = f.read()
-            # Split by special token separator
-            for sample_text in content.split("\n</s>\n"):
-                if sample_text.strip():
-                    yield {"text": sample_text.strip()}
-stream_processed_samples = DatasetEngine.stream_processed_samples
+        with open(self.processed_data_file, "rb") as f:
+            # Read 100k tokens at a time (unsigned short = 2 bytes)
+            chunk_size = 100000 * 2
+            while True:
+                bytes_data = f.read(chunk_size)
+                if not bytes_data:
+                    break
+                bin_data = array.array('H')
+                bin_data.frombytes(bytes_data)
+                for token in bin_data:
+                    yield int(token)

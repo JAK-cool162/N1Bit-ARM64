@@ -25,12 +25,11 @@ from .model import NumPyBitRNNLM
 class Trainer:
     """
     Main Trainer for the 1-Bit AI model.
-    Supports named models, customizable dataset selection, and infinite pre-training.
+    Streams pre-tokenized binary files (.bin) at lightning speed.
     """
     def __init__(self, model_name: str = "default", limit_steps=None):
         self.model_name = model_name
         
-        # Handle infinite steps input
         if limit_steps == "inf" or limit_steps == float('inf'):
             self.limit_steps = float('inf')
         elif limit_steps is not None:
@@ -38,51 +37,28 @@ class Trainer:
         else:
             self.limit_steps = None
             
-        # Get model-specific file paths to isolate models
         self.paths = get_model_paths(self.model_name)
         
-        # Initialize DatasetEngine and Tokenizer with model-isolated paths
-        self.engine = DatasetEngine(self.paths["processed_data"], self.paths["stats"])
+        # Initialize DatasetEngine with model-isolated paths and tokenizer file
+        self.engine = DatasetEngine(self.paths["processed_data"], self.paths["stats"], self.paths["tokenizer"])
         self.tokenizer = SimpleBPETokenizer(vocab_size=4000)
         
         optimize_environment()
         
     def prepare_tokenizer(self):
-        """Trains or loads the custom tokenizer inside the model's directory."""
+        """Loads the tokenizer inside the model's directory."""
         tokenizer_path = self.paths["tokenizer"]
         if os.path.exists(tokenizer_path):
-            print(f"[Trainer] Loading existing tokenizer from {tokenizer_path}")
             self.tokenizer.load(tokenizer_path)
-            return
-
-        print("[Trainer] Tokenizer cache not found. Training tokenizer on clean dataset sample...")
-        texts = []
-        count = 0
-        for sample in self.engine.stream_processed_samples():
-            texts.append(sample["text"])
-            count += 1
-            if count >= 1000:
-                break
-                
-        if not texts:
-            texts = ["Hello, this is a fallback training sentence for our 1-bit ARM64 model."]
-            
-        self.tokenizer.train_from_texts(texts)
-        self.tokenizer.save(tokenizer_path)
-        print(f"[Trainer] Tokenizer trained with vocab size {len(self.tokenizer.vocab)} and saved to {tokenizer_path}")
 
     def get_token_chunk_stream(self) -> List[int]:
-        """Streams and packs tokens into sequences of exactly SEQ_LEN + 1."""
+        """Streams pre-tokenized integers directly from the binary file as segments of SEQ_LEN + 1."""
         buffer = []
-        for sample in self.engine.stream_processed_samples():
-            text = sample["text"]
-            tokens = [self.tokenizer.bos_id] + self.tokenizer.encode(text) + [self.tokenizer.eos_id]
-            buffer.extend(tokens)
-            
-            while len(buffer) >= SEQ_LEN + 1:
-                chunk = buffer[:SEQ_LEN + 1]
+        for token in self.engine.stream_processed_tokens():
+            buffer.append(token)
+            if len(buffer) >= SEQ_LEN + 1:
+                yield buffer[:SEQ_LEN + 1]
                 buffer = buffer[SEQ_LEN + 1:]
-                yield chunk
 
     def get_batch_generator(self, chunk_generator, batch_size: int):
         """Groups sequence chunks into batches."""
@@ -100,9 +76,8 @@ class Trainer:
     def train(self, selected_repos: List[str] = None):
         """
         Trains the named 1-bit model.
-        Supports infinite steps, resuming on progress, and selecting custom repositories.
         """
-        # 1. Preprocess and stats
+        # 1. Preprocess raw data directly to pre-tokenized binary array (.bin)
         self.engine.process_all_datasets(selected_repos=selected_repos)
         self.prepare_tokenizer()
         
@@ -111,7 +86,7 @@ class Trainer:
         start_step = 0
         loss_history = []
         
-        # Load progress if it exists to support resumption!
+        # Load progress if it exists
         resumed = False
         progress_path = self.paths["progress"]
         if os.path.exists(progress_path):
@@ -126,7 +101,6 @@ class Trainer:
             except Exception as e:
                 print(f"[Trainer] Failed to load progress JSON: {e}. Starting fresh.")
 
-        # Infinite loop flag
         is_infinite = (self.limit_steps == float('inf'))
         target_epochs = 100000 if is_infinite else EPOCHS
         
@@ -199,7 +173,6 @@ class Trainer:
                         print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
-                        # Auto-save checkpoints and training progress!
                         self.save_progress(epoch, step, loss_history)
                         torch.save(model.state_dict(), checkpoint_path)
                         self.export_to_numpy(model)
@@ -278,7 +251,6 @@ class Trainer:
                         print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
-                        # Auto-save checkpoints and training progress!
                         self.save_progress(epoch, step, loss_history)
                         np.savez_compressed(
                             numpy_weight_path,
@@ -315,7 +287,6 @@ class Trainer:
                 
             print(f"[Trainer] Training completed in {time.time() - start_time:.2f} seconds.")
             
-            # Save final weights
             np.savez_compressed(
                 numpy_weight_path,
                 model_type=np.array("rnn"),
