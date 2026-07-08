@@ -1,0 +1,9 @@
+# N1Bit-ARM64 dependencies (deliberately tiny)
+torch>=2.0        # the single backend (CPU or CUDA, auto-detected)
+numpy>=1.21       # fast batch sampling from data.bin
+flask>=2.0        # the small web UI (app.py); not needed for CLI-only use
+
+# Optional: only needed to ingest Hugging Face .parquet datasets.
+# Install one of these if `python -m n1bit.data` reports parquet files it can't read.
+# pyarrow>=10
+# pandas>=1.5
