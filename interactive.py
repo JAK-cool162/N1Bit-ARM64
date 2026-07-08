@@ -22,6 +22,12 @@ except ImportError:
     HAS_TORCH = False
 
 from n1bit.model import NumPyBitTransformerLM, NumPyBitRNNLM
+from n1bit.vulkan_engine import is_vulkan_available, get_termux_vulkan_guide
+from n1bit.sandbox import ProotSandbox
+
+# Global variables for sandbox state
+sandbox_active = False
+sandbox_instance = None
 
 def list_existing_models() -> List[str]:
     """Scans cache/ directory to find all existing named models."""
@@ -31,7 +37,6 @@ def list_existing_models() -> List[str]:
     models = []
     for item in os.listdir(CACHE_DIR):
         item_path = os.path.join(CACHE_DIR, item)
-        # If it's a directory and contains model files, treat it as a named model
         if os.path.isdir(item_path):
             if any(f in os.listdir(item_path) for f in ["tokenizer.json", "numpy_weights.npz", "model_checkpoint.pt"]):
                 models.append(item)
@@ -53,7 +58,6 @@ def add_new_dataset_url():
     if "huggingface.co/datasets" not in url:
         print("[Warning] This URL does not look like a standard Hugging Face datasets link, but appending anyway.")
         
-    # Read existing links to avoid duplicates
     existing = []
     if os.path.exists(LINKS_FILE):
         with open(LINKS_FILE, 'r', encoding='utf-8') as f:
@@ -63,7 +67,6 @@ def add_new_dataset_url():
         print("[Info] This URL is already in links.txt!")
         return
         
-    # Append link
     with open(LINKS_FILE, 'a', encoding='utf-8') as f:
         f.write(url + "\n")
         
@@ -123,27 +126,20 @@ def load_numpy_model(npz_path: str):
         return NumPyBitTransformerLM(weights_dict), "transformer"
 
 def show_neuron_states(model, is_numpy: bool, model_type: str):
-    """
-    Displays what the 1-bit AI was made of (neuron binary states).
-    Shows statistics of +1 vs -1 weights, exposing active 1-bit connections.
-    """
+    """Displays neuron binary states."""
     print("\n" + "="*50)
     print("          NEURON STATE STATISTICS (1-BIT ANALYSIS)")
     print("="*50)
     
     weights = []
-    
     if is_numpy:
         if model_type == "rnn":
-            # RNN parameters
             weights.extend([model.W_xh, model.W_hh, model.W_hy])
         else:
-            # Transformer weights
             weights.extend([model.lm_head.weight])
             for b in model.blocks:
                 weights.extend([b.attn.q_proj.weight, b.attn.k_proj.weight, b.attn.v_proj.weight, b.attn.out_proj.weight])
     else:
-        # PyTorch model state dict
         for name, param in model.named_parameters():
             if "weight" in name and "embedding" not in name and "ln" not in name:
                 weights.append(param.detach().cpu().numpy())
@@ -157,10 +153,9 @@ def show_neuron_states(model, is_numpy: bool, model_type: str):
     total_negative = 0
     
     for w in weights:
-        # Sign of weights
         signs = np.sign(w)
         total_weights += signs.size
-        total_positive += np.sum(signs >= 0)  # Count zeros as positive
+        total_positive += np.sum(signs >= 0)
         total_negative += np.sum(signs < 0)
         
     pos_percent = (total_positive / total_weights) * 100
@@ -171,7 +166,6 @@ def show_neuron_states(model, is_numpy: bool, model_type: str):
     print(f"Active Negative (-1) States:   {total_negative:,} ({neg_percent:.2f}%)")
     print("-" * 50)
     print("Visualizing 1-bit Connection Grid (sample of 40 states):")
-    # Show grid of 40 neuron states
     flat_signs = np.concatenate([w.flatten() for w in weights])
     sample_states = np.random.choice(flat_signs, min(len(flat_signs), 40), replace=False)
     grid = "".join(["█" if s >= 0 else "░" for s in sample_states])
@@ -191,9 +185,9 @@ def print_banner():
     print("="*60)
 
 def main():
+    global sandbox_active, sandbox_instance
     print_banner()
     
-    # 1. Choose model to load
     available_models = list_existing_models()
     print("\nAvailable Named Models inside cache directory:")
     for idx, name in enumerate(available_models, 1):
@@ -215,9 +209,11 @@ def main():
     
     print("\n[System Status]")
     print(f"- PyTorch available:      {HAS_TORCH}")
+    print(f"- Vulkan GPU Compute:     {is_vulkan_available()}")
     print(f"- Tokenizer trained:      {tokenizer_exists}")
     print(f"- PyTorch Model Checkpoint:{pytorch_checkpoint_exists}")
     print(f"- NumPy Model Checkpoint:  {numpy_checkpoint_exists}")
+    print(f"- Ubuntu Sandbox Mode:    {'ACTIVE' if sandbox_active else 'INACTIVE'}")
     
     if os.path.exists(paths["stats"]):
         with open(paths["stats"], 'r') as f:
@@ -232,9 +228,11 @@ def main():
         print("4. Add a new Hugging Face dataset URL directly to links.txt")
         print("5. Analyze Model Weights (+1 vs -1 States)")
         print("6. Display Pre-processing Statistics")
-        print("7. Exit")
+        print("7. Toggle Ubuntu PRoot Sandbox Environment")
+        print("8. Display Vulkan GPU Acceleration Info")
+        print("9. Exit")
         
-        choice = input("\nEnter choice (1-7): ").strip()
+        choice = input("\nEnter choice (1-9): ").strip()
         
         if choice == "1":
             print(f"\n[Starting Pre-training Pipeline for model '{model_name}']")
@@ -242,7 +240,6 @@ def main():
             trainer = Trainer(model_name=model_name, limit_steps=limit)
             trainer.train()
             
-            # Refresh path states
             tokenizer_exists = os.path.exists(paths["tokenizer"])
             pytorch_checkpoint_exists = os.path.exists(paths["checkpoint"])
             numpy_checkpoint_exists = os.path.exists(paths["numpy_weights"])
@@ -294,7 +291,6 @@ def main():
                 print("[Error] No model checkpoint exists yet. Please train your model first!")
                 continue
                 
-            # If PyTorch is available, load it, otherwise NumPy
             if HAS_TORCH and pytorch_checkpoint_exists:
                 tokenizer = SimpleBPETokenizer()
                 tokenizer.load(paths["tokenizer"])
@@ -332,16 +328,35 @@ def main():
                 print("[Error] No statistics file found for this model. Please run Option 1 to preprocess.")
                 
         elif choice == "7":
+            sandbox_active = not sandbox_active
+            if sandbox_active:
+                sandbox_instance = ProotSandbox()
+                print(f"\n[Sandbox] Ubuntu PRoot Sandbox Environment is now ACTIVE!")
+                print(f"[Sandbox] Working directory isolated to: {sandbox_instance.root_dir}/")
+                if sandbox_instance.has_proot:
+                    print("[Sandbox] Native 'proot' binary found on phone! Full simulation enabled.")
+                else:
+                    print("[Sandbox] 'proot' not found in system path. Running in secure simulated sandbox.")
+            else:
+                sandbox_instance = None
+                print("\n[Sandbox] Ubuntu PRoot Sandbox Environment is now INACTIVE.")
+                
+        elif choice == "8":
+            print(get_termux_vulkan_guide())
+            
+        elif choice == "9":
             print("\nExiting. Thank you for using N1Bit-ARM64 AI!")
             break
         else:
-            print("[Error] Invalid option. Please enter 1-7.")
+            print("[Error] Invalid option. Please enter 1-9.")
 
 def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
-    """Interactive loop to prompt the 1-bit AI model with real-time thought logs."""
+    """Interactive loop to prompt the 1-bit AI model with optional sandbox execution."""
+    global sandbox_active, sandbox_instance
     print("\n" + "-"*50)
     engine_name = f"Pure NumPy 1-bit {model_type.upper()}" if is_numpy else f"PyTorch 1-bit {model_type.upper()}"
     print(f" Chatting with N1Bit-ARM64 Model ({engine_name})")
+    print(f" PRoot Sandbox Mode: {'ACTIVE 🛡️' if sandbox_active else 'INACTIVE ❌'}")
     print(" Type 'exit' or 'quit' to return to main menu.")
     print("-"*50)
     
@@ -359,10 +374,7 @@ def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
         prompt_ids = prompt_ids[-SEQ_LEN+20:]
         prompt_ids = [tokenizer.bos_id] + prompt_ids
         
-        # Generation with thought-log (showing token probability distributions!)
-        print("\nAI Thinking Logs:")
-        
-        # We manually run a forward pass of prompt to show next top-5 tokens prediction (what the AI is thinking!)
+        # Thinking Log
         if is_numpy:
             context_ids = np.array([prompt_ids], dtype=np.int32)
             logits = model.forward(context_ids)
@@ -373,33 +385,70 @@ def run_chat_loop(model, tokenizer, is_numpy: bool, model_type: str):
                 logits, _ = model(context_ids)
             next_logits = logits[0, -1, :].cpu().numpy().astype(np.float32)
             
-        # Softmax to get percentages
         exp_logits = np.exp(next_logits - np.max(next_logits))
         probs = exp_logits / np.sum(exp_logits)
         
-        # Sort and get top-5
         top_indices = np.argsort(probs)[::-1][:5]
+        print("\nAI Thinking Logs:")
         print("--------------------------------------------------")
-        print("Top 5 Token Alternatives (What the AI is thinking):")
         for i, idx in enumerate(top_indices, 1):
-            token_str = tokenizer.inverse_vocab.get(idx, tokenizer.inverse_vocab.get(str(idx), "<unk>"))
-            # Escape newlines
+            token_str = tokenizer.inverse_vocab.get(str(idx), tokenizer.inverse_vocab.get(idx, "<unk>"))
             token_str = repr(token_str)
             print(f"  {i}. {token_str:<12} | Probability: {probs[idx]*100:5.2f}%")
         print("--------------------------------------------------")
         
-        # Run generation
+        # Generate Response
         output_ids = model.generate(prompt_ids, max_new_tokens=40, temperature=0.7)
-            
-        num_prompt_tokens = len(prompt_ids)
-        new_ids = output_ids[num_prompt_tokens:]
+        new_ids = output_ids[len(prompt_ids):]
+        response = tokenizer.decode(new_ids).strip()
         
-        response = tokenizer.decode(new_ids)
-        print("\nAI Response: ", end="")
-        if not response.strip():
+        print("\nAI Response: ")
+        if not response:
             print("[N1Bit Engine is thinking...] (No response generated yet, ensure model is fully trained)")
-        else:
-            print(response.strip())
+            continue
+            
+        print(response)
+        
+        # SANDBOX INTERCEPTION
+        if sandbox_active and sandbox_instance is not None:
+            # Check for Python or Bash code blocks
+            python_matches = re.findall(r'```python\n(.*?)```', response, re.DOTALL)
+            bash_matches = re.findall(r'```(?:bash|sh)\n(.*?)```', response, re.DOTALL)
+            
+            if python_matches:
+                code_to_run = python_matches[0].strip()
+                print("\n" + "="*50)
+                print("🛡️ [Sandbox Guard] Python Code Block Detected in AI Output!")
+                print("="*50)
+                print(code_to_run)
+                print("-" * 50)
+                run_choice = input("Do you want to execute this Python code inside the PRoot Ubuntu Sandbox? (y/n): ").strip().lower()
+                if run_choice == 'y':
+                    print("\n[Sandbox] Launching script...")
+                    res = sandbox_instance.execute_python_code(code_to_run)
+                    print(f"\n[Sandbox Stdout]:\n{res['stdout']}")
+                    if res['stderr']:
+                        print(f"\n[Sandbox Stderr]:\n{res['stderr']}")
+                    print(f"[Sandbox Exit Code]: {res['exit_code']}")
+                    print("="*50)
+                    
+            elif bash_matches:
+                cmd_to_run = bash_matches[0].strip()
+                print("\n" + "="*50)
+                print("🛡️ [Sandbox Guard] Shell Command Block Detected in AI Output!")
+                print("="*50)
+                print(cmd_to_run)
+                print("-" * 50)
+                run_choice = input("Do you want to execute this shell command inside the PRoot Ubuntu Sandbox? (y/n): ").strip().lower()
+                if run_choice == 'y':
+                    print("\n[Sandbox] Executing command...")
+                    res = sandbox_instance.execute_command(cmd_to_run)
+                    print(f"\n[Sandbox Stdout]:\n{res['stdout']}")
+                    if res['stderr']:
+                        print(f"\n[Sandbox Stderr]:\n{res['stderr']}")
+                    print(f"[Sandbox Exit Code]: {res['exit_code']}")
+                    print("="*50)
+                    
         print()
 
 if __name__ == "__main__":
