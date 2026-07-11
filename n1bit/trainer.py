@@ -154,7 +154,7 @@ class Trainer:
             epoch = start_epoch
             while True:
                 chunk_gen = self.get_token_chunk_stream(selected_repos=selected_repos)
-                batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
+                batch_gen = self.get_batch_generator(chunk_gen, active_batch_size)
                 
                 for batch_data in batch_gen:
                     step += 1
@@ -167,18 +167,24 @@ class Trainer:
                     y = batch_tensor[:, 1:]
                     
                     optimizer.zero_grad()
-                    logits, loss = model(x, y)
                     
-                    loss.backward()
+                    # Autocast matrix multiplications to Float16 dynamically
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                        logits, loss = model(x, y)
+                        
+                    # Scales the loss and backpropagates gradients safely without FP16 underflows
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
                     
                     total_loss += loss.item()
                     
                     if step % 10 == 0 or step == 1:
                         avg_loss = total_loss / (1.0 if step == 1 or total_loss == loss.item() else 10.0)
                         loss_history.append({"epoch": epoch, "step": step, "loss": avg_loss})
-                        tokens_per_sec = (step * BATCH_SIZE * SEQ_LEN) / (time.time() - start_time)
+                        tokens_per_sec = (step * active_batch_size * active_seq_len) / (time.time() - start_time)
                         print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
@@ -251,7 +257,7 @@ class Trainer:
             epoch = start_epoch
             while True:
                 chunk_gen = self.get_token_chunk_stream(selected_repos=selected_repos)
-                batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
+                batch_gen = self.get_batch_generator(chunk_gen, active_batch_size)
                 
                 for batch_data in batch_gen:
                     step += 1
@@ -269,7 +275,7 @@ class Trainer:
                     if step % 10 == 0 or step == 1:
                         avg_loss = total_loss / (1.0 if step == 1 or total_loss == loss else 10.0)
                         loss_history.append({"epoch": epoch, "step": step, "loss": avg_loss})
-                        tokens_per_sec = (step * BATCH_SIZE * SEQ_LEN) / (time.time() - start_time)
+                        tokens_per_sec = (step * active_batch_size * active_seq_len) / (time.time() - start_time)
                         print(f"[{self.model_name}] Epoch {epoch} | Step {step:4d} | Loss: {avg_loss:.4f} | GPU Speed: {tokens_per_sec:.1f} tok/sec")
                         total_loss = 0.0
                         
