@@ -120,21 +120,50 @@ class Trainer:
         use_vulkan_gputrain = not has_cuda
         
         if HAS_TORCH and not use_vulkan_gputrain:
+            device = torch.device("cuda")
+            
+            # =========================================================
+            # AUTOMATIC GPU VRAM MAXIMIZER & BATCH SCALER
+            # =========================================================
+            vram_bytes = torch.cuda.get_device_properties(device).total_memory
+            vram_gb = vram_bytes / (1024 ** 3)
+            
+            active_batch_size = BATCH_SIZE
+            active_seq_len = SEQ_LEN
+            active_batch_size = BATCH_SIZE
+            active_embed_dim = EMBED_DIM
+            
+            print(f"[VRAM Maximizer] Detected GPU with {vram_gb:.2f} GB VRAM.")
+            if vram_gb >= 12.0:
+                active_batch_size = 256
+                active_seq_len = 256
+                active_embed_dim = 512
+                print(f"[VRAM Maximizer] Maximizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}, Embed to {active_embed_dim}!")
+            elif vram_gb >= 6.0:
+                active_batch_size = 128
+                active_seq_len = 128
+                active_embed_dim = 256
+                print(f"[VRAM Maximizer] Optimizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}, Embed to {active_embed_dim}!")
+            else:
+                active_batch_size = 64
+                active_seq_len = 128
+                print(f"[VRAM Maximizer] Conserving VRAM: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}!")
+                
             print(f"[Trainer] Running named model '{self.model_name}' in HIGH-SPEED PYTORCH CUDA mode.")
             model = BitTransformerLM(
                 vocab_size=vocab_size,
-                embed_dim=EMBED_DIM,
+                embed_dim=active_embed_dim,
                 num_layers=NUM_LAYERS,
                 num_heads=NUM_HEADS,
-                seq_len=SEQ_LEN
+                seq_len=active_seq_len
             )
             
-            device = torch.device("cuda")
             model.to(device)
             
-            if USE_16BIT:
-                model = model.half()
-                print("[Trainer] CUDA detected. Enabling Float16 precision for training acceleration.")
+            # Setup PyTorch GradScaler for Mixed Precision training (AMP) to maximize speed & VRAM efficiency
+            scaler = torch.cuda.amp.GradScaler()
+            use_fp16 = True
+            print("[Trainer] Mixed-Precision (AMP) enabled to maximize tensor cores and VRAM utilization.")
                 
             optimizer = AdamW(model.parameters(), lr=LR, weight_decay=0.01)
             model.train()
