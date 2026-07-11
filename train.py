@@ -102,6 +102,7 @@ def main():
     parser.add_argument("--steps", "-s", default=None, help="Number of training steps or 'inf'")
     parser.add_argument("--name", "-n", default="default", help="Name of the model to train")
     parser.add_argument("--profile", "-p", default=None, help="Target profile index (1-4)")
+    parser.add_argument("--preprocess", action="store_true", help="Force pre-processing and caching of all selected datasets at once")
     
     args, unknown = parser.parse_known_args()
     
@@ -195,6 +196,12 @@ def main():
     t_mod.NUM_HEADS = num_heads
     t_mod.SEQ_LEN = seq_len
     
+    if args.preprocess:
+        print("[Trainer] Force pre-processing flag active. Downloading, cleaning, and compiling all selected datasets...")
+        trainer.engine.process_all_datasets(selected_repos=selected_repos)
+        print("[Trainer] Complete pre-processing database compilation finished successfully!")
+        sys.exit(0)
+        
     trainer.train(selected_repos=selected_repos)
 
 if __name__ == "__main__":
