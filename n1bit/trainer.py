@@ -275,6 +275,53 @@ class Trainer:
                         torch.save(model.state_dict(), checkpoint_path)
                         self.export_to_numpy(model)
                         
+                    # =========================================================
+                    # PERIODIC LIVE RLAIF REINFORCEMENT LEARNING INTERCEPT
+                    # =========================================================
+                    # Runs a live interactive Reward Bot alignment step every 100 steps
+                    # to show real-time evaluations, questions, and weights adjustment!
+                    if step % 100 == 0:
+                        print(f"\n  [RLAIF Guard] Intercepting step {step} for active Reward Bot alignment fine-tuning...")
+                        rl_prompts = [
+                            "Hello",
+                            "Whats 1+3",
+                            "What is a 1-bit neural network?",
+                            "How do we optimize LLMs for ARM64 architecture?"
+                        ]
+                        
+                        # Run 3 live steps of the Reward Bot asking questions!
+                        for rl_sub_step in range(3):
+                            prompt = random.choice(rl_prompts)
+                            prompt_ids = self.tokenizer.encode(f"<instruction>: {prompt}\n<response>:")
+                            prompt_ids = [self.tokenizer.bos_id] + prompt_ids
+                            
+                            # Generate AI response
+                            model.eval()
+                            with torch.no_grad():
+                                output_ids = model.generate(prompt_ids, max_new_tokens=25, temperature=0.7)
+                            response_text = self.tokenizer.decode(output_ids[len(prompt_ids):]).strip()
+                            
+                            # Compute reward
+                            reward = compute_ai_reward(prompt, response_text)
+                            
+                            # Update model weights using policy gradients
+                            model.train()
+                            optimizer.zero_grad()
+                            x_tensor = torch.tensor([output_ids[:-1]], dtype=torch.long, device=device)
+                            y_tensor = torch.tensor([output_ids[1:]], dtype=torch.long, device=device)
+                            
+                            with torch.amp.autocast('cuda', dtype=torch.float16):
+                                logits, _ = model(x_tensor)
+                                loss_val = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y_tensor.reshape(-1))
+                                
+                            rl_loss = loss_val * (-reward)
+                            scaler.scale(rl_loss).backward()
+                            scaler.step(optimizer)
+                            scaler.update()
+                            
+                            print(f"  [RLAIF Bot] Question: '{prompt}' | AI: '{response_text[:40]}...' | Reward: {reward:+.2f}")
+                        print("  [RLAIF Guard] Live alignment step complete. Resuming standard pre-training pre-tokens stream...\n")
+                        
                     if not is_infinite and self.limit_steps and step >= self.limit_steps:
                         print(f"[Trainer] Reached step limit: {self.limit_steps}")
                         break
