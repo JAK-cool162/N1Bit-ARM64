@@ -445,13 +445,13 @@ class NumPyBitRNNLM:
             x_emb[t] = self.q_activation(self.E[X[t]].T).astype(dtype)
             
             # Accelerating compute projection via native Vulkan dispatch (ctypes + SPIR-V)!
-            proj_xh = self.vulkan.run_matmul(x_emb[t], W_xh_f)
-            proj_hh = self.vulkan.run_matmul(h[t-1], W_hh_f)
+            proj_xh = self.vulkan.run_matmul(W_xh_f, x_emb[t])
+            proj_hh = self.vulkan.run_matmul(W_hh_f, h[t-1])
             
             a[t] = proj_xh.reshape(-1, batch_size) + proj_hh.reshape(-1, batch_size) + self.b_h
             h[t] = np.tanh(a[t]).astype(dtype)
             
-            logits_t = self.vulkan.run_matmul(h[t], W_hy_f).reshape(-1, batch_size) + self.b_y
+            logits_t = self.vulkan.run_matmul(W_hy_f, h[t]).reshape(-1, batch_size) + self.b_y
             
             max_logits = np.max(logits_t, axis=0, keepdims=True)
             exp_logits = np.exp((logits_t - max_logits).astype(np.float32))
@@ -478,21 +478,21 @@ class NumPyBitRNNLM:
             dy = dy.astype(dtype)
             
             # Vulkan dispatch for backprop projections!
-            dW_hy += self.vulkan.run_matmul(h[t], dy.T).T
+            dW_hy += self.vulkan.run_matmul(dy, h[t].T)
             db_y += np.sum(dy, axis=1, keepdims=True)
             
-            dh = self.vulkan.run_matmul(dy.T, W_hy_f).T + dh_next
+            dh = self.vulkan.run_matmul(W_hy_f.T, dy) + dh_next
             da = (dh * (1.0 - h[t]**2)).astype(dtype)
             
-            dW_xh += self.vulkan.run_matmul(x_emb[t], da.T).T
-            dW_hh += self.vulkan.run_matmul(h[t-1], da.T).T
+            dW_xh += self.vulkan.run_matmul(da, x_emb[t].T)
+            dW_hh += self.vulkan.run_matmul(da, h[t-1].T)
             db_h += np.sum(da, axis=1, keepdims=True)
             
-            dx = self.vulkan.run_matmul(da.T, W_xh_f).T
+            dx = self.vulkan.run_matmul(W_xh_f.T, da)
             for b in range(batch_size):
                 dE[X[t, b]] += dx[:, b]
                 
-            dh_next = self.vulkan.run_matmul(da.T, W_hh_f).T
+            dh_next = self.vulkan.run_matmul(W_hh_f.T, da)
             
         self.t += 1
         eps = 1e-4 if dtype == np.float16 else 1e-8

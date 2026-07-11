@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import argparse
 
 # Add parent directory to path to ensure correct package import
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -18,7 +19,6 @@ def show_dataset_selector() -> list:
     print("          CHOOSE DATASETS FOR YOUR NAMED MODEL")
     print("="*60)
     
-    # Read links
     temp_engine = DatasetEngine("cache/temp.jsonl", "cache/temp.json")
     urls = temp_engine.read_links()
     
@@ -35,13 +35,18 @@ def show_dataset_selector() -> list:
     print("- Type numbers separated by commas (e.g., '1, 3, 10, 15') to select specific datasets.")
     print("- Type 'all' or press Enter to train on ALL datasets.")
     
-    choice = input("\nYour selection: ").strip()
-    if not choice or choice.lower() == "all":
-        print("Selected ALL datasets.")
+    # Non-interactive terminal safety
+    if not sys.stdin.isatty():
+        print("Non-interactive terminal detected, selecting ALL datasets by default.")
         return None
         
-    selected_repos = []
     try:
+        choice = input("\nYour selection: ").strip()
+        if not choice or choice.lower() == "all":
+            print("Selected ALL datasets.")
+            return None
+            
+        selected_repos = []
         indices = [int(x.strip()) for x in choice.split(",") if x.strip().isdigit()]
         for idx in indices:
             if 1 <= idx <= len(repos):
@@ -70,8 +75,16 @@ def show_profile_selector() -> dict:
         print(f"    - Target Chips: {p['description']}")
         print(f"    - Recommendation: {p['recommendation']}\n")
         
-    choice = input("Select profile (1-4, press Enter for standard '2' Midrange): ").strip()
-    if not choice:
+    # Non-interactive safety
+    if not sys.stdin.isatty():
+        print("Non-interactive terminal detected, selecting MIDRANGE profile by default.")
+        return MODEL_PROFILES["2"]
+        
+    try:
+        choice = input("Select profile (1-4, press Enter for standard '2' Midrange): ").strip()
+        if not choice:
+            choice = "2"
+    except Exception:
         choice = "2"
         
     profile = MODEL_PROFILES.get(choice, MODEL_PROFILES["2"])
@@ -83,47 +96,65 @@ def main():
     print("           N1Bit-ARM64 Pre-Training Runner")
     print("="*60)
     
-    # Defaults
-    model_name = "default"
-    limit_steps = None
-    selected_repos = None
+    # 1. Setup argparse for robust parsing (Colab & CLI friendly)
+    parser = argparse.ArgumentParser(description="N1Bit-ARM64 Pre-Training Runner")
+    parser.add_argument("steps_pos", nargs="?", default=None, help="Steps (positional argument fallback)")
+    parser.add_argument("--steps", "-s", default=None, help="Number of training steps or 'inf'")
+    parser.add_argument("--name", "-n", default="default", help="Name of the model to train")
+    parser.add_argument("--profile", "-p", default=None, help="Target profile index (1-4)")
     
-    # Selected dimensions from profile
+    args, unknown = parser.parse_known_args()
+    
+    # Defaults
+    model_name = args.name
+    limit_steps = args.steps if args.steps is not None else args.steps_pos
+    selected_repos = None
+    profile_id = args.profile
+    
+    # Selected dimensions defaults (Midrange Profile)
     embed_dim = EMBED_DIM
     num_layers = NUM_LAYERS
     num_heads = NUM_HEADS
     seq_len = SEQ_LEN
     
-    args = sys.argv[1:]
-    
-    # 1. Custom model name check: python train.py name coder [steps]
-    if len(args) >= 2 and args[0].lower() == "name":
-        model_name = args[1]
+    # 2. Handled word-based positional fallbacks: e.g. python train.py name coder 500000
+    if len(sys.argv) >= 3 and sys.argv[1].lower() == "name":
+        model_name = sys.argv[2]
         print(f"Initializing named model: '{model_name}'")
         
-        # 1. Hardware Profile Selection
-        profile = show_profile_selector()
+        # Hardware Profile Selection
+        if profile_id is None:
+            profile = show_profile_selector()
+        else:
+            profile = MODEL_PROFILES.get(profile_id, MODEL_PROFILES["2"])
+            
         embed_dim = profile["embed_dim"]
         num_layers = profile["num_layers"]
         num_heads = profile["num_heads"]
         seq_len = profile["seq_len"]
         
-        # 2. Interactive dataset selection
+        # Dataset selection
         selected_repos = show_dataset_selector()
         
-        # Check if third argument is steps (e.g., inf or 50)
-        if len(args) >= 3:
-            limit_steps = args[2]
+        if len(sys.argv) >= 4:
+            limit_steps = sys.argv[3]
             
-    # 2. Standard step check: python train.py [steps] (like python train.py 50 or python train.py inf)
-    elif len(args) >= 1:
-        limit_steps = args[0]
-        
-    # Isolate parameters globally by writing to config file
+    # Resolve step count variables
+    if limit_steps is not None:
+        # Strip potential --steps if parsed improperly
+        limit_steps = str(limit_steps).replace("--steps", "").strip()
+        if limit_steps == "inf":
+            pass
+        elif limit_steps.isdigit():
+            limit_steps = int(limit_steps)
+        else:
+            # Handle empty or invalid formats
+            limit_steps = None
+
     paths = get_model_paths(model_name)
     config_path = os.path.join(paths["model_dir"], "model_config.json")
     
-    # Estimate total parameters (assuming vocab_size is around ~4000)
+    # Estimate total parameters
     estimated_params = calculate_parameter_count(4000, embed_dim, num_layers, seq_len)
     print(f"\n[Model Architecture Details]: '{model_name}'")
     print(f"  - Embedding Dimension:  {embed_dim}")
@@ -157,9 +188,7 @@ def main():
     # Start Trainer
     trainer = Trainer(model_name=model_name, limit_steps=limit_steps)
     
-    # Inject loaded dimensions to the trainer if customized!
-    # (So PyTorch or NumPy model compiles with the chosen dimensions)
-    # Yes, we override config values inside n1bit module
+    # Inject dimensions dynamically
     import n1bit.trainer as t_mod
     t_mod.EMBED_DIM = embed_dim
     t_mod.NUM_LAYERS = num_layers

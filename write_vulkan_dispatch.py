@@ -1,4 +1,6 @@
 import os
+
+content = """import os
 import sys
 import ctypes
 import numpy as np
@@ -76,10 +78,16 @@ class VulkanDispatcher:
             pass
 
     def run_matmul(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """
+        \"\"\"
         Vulkan-accelerated drop-in replacement for np.dot(a, b).
         Guarantees 100% numerical correctness and zero Python loop overhead.
-        """
+        \"\"\"
         # Standard fast NumPy dot calculation
         # If Vulkan GPU acceleration is fully active, we can offload vector dot products
         return np.dot(a, b)
+"""
+
+with open("n1bit/vulkan_dispatch.py", "w", encoding="utf-8") as f:
+    f.write(content)
+
+print("SUCCESS")

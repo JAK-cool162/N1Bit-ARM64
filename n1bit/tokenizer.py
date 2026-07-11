@@ -235,3 +235,6 @@ class SimpleBPETokenizer:
             parts = k.split("|||")
             if len(parts) == 2:
                 self.merges[(parts[0], parts[1])] = v
+
+# Alias for backward compatibility with custom loaders
+ByteTokenizer = SimpleBPETokenizer

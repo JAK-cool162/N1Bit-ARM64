@@ -5,6 +5,9 @@ import platform
 LINKS_FILE = "links.txt"
 CACHE_DIR = "cache"
 RAW_DOWNLOADS_DIR = "downloads"
+DATA_BIN = "cache/data.bin"
+MANIFEST = "cache/manifest.json"
+EOS_ID = 2
 
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(RAW_DOWNLOADS_DIR, exist_ok=True)
