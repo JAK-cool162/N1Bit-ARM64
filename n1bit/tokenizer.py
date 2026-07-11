@@ -119,71 +119,71 @@ class SimpleBPETokenizer:
     def encode(self, text: str) -> List[int]:
         """
         Encodes text into a list of token IDs.
+        Protects special tokens from being broken into individual characters.
         """
         if not text:
             return []
             
-        # Pre-tokenize into characters
-        words = text.split(' ')
-        token_ids = []
+        import re
+        # Match special tokens
+        pattern = re.compile("(" + "|".join(re.escape(t) for t in self.special_tokens) + ")")
+        parts = pattern.split(text)
         
-        for idx, word in enumerate(words):
-            if idx > 0:
-                # Add space token
-                if " " in self.vocab:
-                    token_ids.append(self.vocab[" "])
-                else:
-                    token_ids.append(self.vocab.get(" ", self.unk_id))
-                    
-            # Encode each word using trained merges
-            chars = list(word)
-            while True:
-                # Find all pairs in current list of characters/tokens
-                pairs = [(chars[i], chars[i+1]) for i in range(len(chars) - 1)]
-                if not pairs:
-                    break
-                    
-                # Find the pair that is merged first in our merges dictionary
-                best_pair = None
-                best_rank = float('inf')
-                for pair in pairs:
-                    if pair in self.merges:
-                        # The merges dict preserves insertion order or rank
-                        rank = list(self.merges.keys()).index(pair)
-                        if rank < best_rank:
-                            best_rank = rank
-                            best_pair = pair
-                            
-                if best_pair is None:
-                    break
-                    
-                # Merge the pair
-                new_token = self.merges[best_pair]
-                i = 0
-                new_chars = []
-                while i < len(chars):
-                    if i < len(chars) - 1 and (chars[i], chars[i+1]) == best_pair:
-                        new_chars.append(new_token)
-                        i += 2
-                    else:
-                        new_chars.append(chars[i])
-                        i += 1
-                chars = new_chars
+        token_ids = []
+        for part in parts:
+            if not part:
+                continue
                 
-            # Convert merged tokens to IDs
-            for token in chars:
-                if token in self.vocab:
-                    token_ids.append(self.vocab[token])
-                else:
-                    # Fallback to byte or character pieces, or unk
-                    # Try character fallback
-                    if len(token) > 1:
-                        # Try to encode sub-characters
-                        for char in token:
-                            token_ids.append(self.vocab.get(char, self.unk_id))
-                    else:
-                        token_ids.append(self.vocab.get(token, self.unk_id))
+            # If it is a special token, yield its ID directly!
+            if part in self.vocab:
+                token_ids.append(self.vocab[part])
+            else:
+                # Otherwise, tokenize using normal word-based BPE merges
+                words = part.split(' ')
+                for idx, word in enumerate(words):
+                    if idx > 0:
+                        token_ids.append(self.vocab.get(" ", self.unk_id))
                         
+                    chars = list(word)
+                    while True:
+                        pairs = [(chars[i], chars[i+1]) for i in range(len(chars) - 1)]
+                        if not pairs:
+                            break
+                            
+                        best_pair = None
+                        best_rank = float('inf')
+                        for pair in pairs:
+                            if pair in self.merges:
+                                rank = list(self.merges.keys()).index(pair)
+                                if rank < best_rank:
+                                    best_rank = rank
+                                    best_pair = pair
+                                    
+                        if best_pair is None:
+                            break
+                            
+                        new_token = self.merges[best_pair]
+                        i = 0
+                        new_chars = []
+                        while i < len(chars):
+                            if i < len(chars) - 1 and (chars[i], chars[i+1]) == best_pair:
+                                new_chars.append(new_token)
+                                i += 2
+                            else:
+                                new_chars.append(chars[i])
+                                i += 1
+                        chars = new_chars
+                        
+                    for token in chars:
+                        if token in self.vocab:
+                            token_ids.append(self.vocab[token])
+                        else:
+                            if len(token) > 1:
+                                for char in token:
+                                    token_ids.append(self.vocab.get(char, self.unk_id))
+                            else:
+                                token_ids.append(self.vocab.get(token, self.unk_id))
+                                
         return token_ids
 
     def decode(self, ids: List[int]) -> str:

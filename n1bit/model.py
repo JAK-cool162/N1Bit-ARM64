@@ -152,7 +152,7 @@ if HAS_TORCH:
             ])
             
             self.ln_f = nn.LayerNorm(embed_dim)
-            self.lm_head = BitLinear(embed_dim, self.vocab_size, bias=False)
+            self.lm_head = nn.Linear(embed_dim, self.vocab_size, bias=False)
 
         def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
             batch_size, seq_len = input_ids.size()
@@ -326,6 +326,8 @@ class NumPyBitTransformerLM:
         self.ln_f_w = weights_dict["ln_f_w"].astype(dtype)
         self.ln_f_b = weights_dict["ln_f_b"].astype(dtype)
         self.lm_head = NumPyBitLinear(weights_dict["lm_head_w"])
+        # Keep lm_head in full precision to match training
+        self.lm_head.w_quant = weights_dict["lm_head_w"]
         
         self.blocks = []
         for block_data in weights_dict["blocks"]:
