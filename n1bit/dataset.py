@@ -25,6 +25,16 @@ try:
 except ImportError:
     HAS_DATASETS_AND_ARROW = False
 
+# Repositories containing heavy images or textures to skip during text training
+IMAGE_REPOS = [
+    "Bingsu/Gameplay_Images", 
+    "dream-textures/textures-color-normal-1k", 
+    "davanstrien/test_push_to_hub_image", 
+    "hmnshudhmn24/real-fake-ai-generated-art-images", 
+    "jcrzd/engineering-drawings-as1100", 
+    "achang/draw_svg"
+]
+
 class DatasetEngine:
     """
     Highly robust and efficient Dataset Engine designed for 1-bit ARM64/Mobile systems.
@@ -677,6 +687,11 @@ class DatasetEngine:
             repo_id = self.parse_repo_id(url)
             
             if selected_repos is not None and repo_id not in selected_repos:
+                continue
+                
+            # Automatically skip heavy image/texture datasets during standard text pre-training
+            # Keeps text pre-training blazing fast and latency-free!
+            if repo_id in IMAGE_REPOS and (selected_repos is None or repo_id not in selected_repos):
                 continue
                 
             # Create a model-specific cache file for this specific dataset
