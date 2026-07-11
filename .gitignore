@@ -217,8 +217,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# N1Bit local cache and outputs
+# N1Bit local cache
 cache/
-builds/
-*.bin
-*.pt
