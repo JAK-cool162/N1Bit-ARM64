@@ -160,6 +160,7 @@ if HAS_TORCH:
             
             positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             x = self.token_embedding(input_ids) + self.position_embedding(positions)
+            dtype = x.dtype
             
             mask = torch.tril(torch.ones((seq_len, seq_len), device=device)).view(1, 1, seq_len, seq_len)
             

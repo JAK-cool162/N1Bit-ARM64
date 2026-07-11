@@ -139,24 +139,22 @@ class Trainer:
             
             print(f"[VRAM Maximizer] Detected GPU with {vram_gb:.2f} GB VRAM.")
             if vram_gb >= 12.0:
-                active_batch_size = 256
-                active_seq_len = 256
-                active_embed_dim = 512
-                print(f"[VRAM Maximizer] Maximizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}, Embed to {active_embed_dim}!")
-            elif vram_gb >= 6.0:
                 active_batch_size = 128
                 active_seq_len = 128
-                active_embed_dim = 256
-                print(f"[VRAM Maximizer] Optimizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}, Embed to {active_embed_dim}!")
-            else:
+                print(f"[VRAM Maximizer] Maximizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}!")
+            elif vram_gb >= 6.0:
                 active_batch_size = 64
                 active_seq_len = 128
+                print(f"[VRAM Maximizer] Optimizing GPU saturation: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}!")
+            else:
+                active_batch_size = 32
+                active_seq_len = 64
                 print(f"[VRAM Maximizer] Conserving VRAM: Scaling Batch Size to {active_batch_size}, Context to {active_seq_len}!")
                 
             print(f"[Trainer] Running named model '{self.model_name}' in HIGH-SPEED PYTORCH CUDA mode.")
             model = BitTransformerLM(
                 vocab_size=vocab_size,
-                embed_dim=active_embed_dim,
+                embed_dim=EMBED_DIM,
                 num_layers=NUM_LAYERS,
                 num_heads=NUM_HEADS,
                 seq_len=active_seq_len
