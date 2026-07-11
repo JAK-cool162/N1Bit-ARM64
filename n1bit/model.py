@@ -50,8 +50,8 @@ if HAS_TORCH:
                 nn.init.zeros_(self.bias)
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
-            dtype = torch.float16 if USE_16BIT else torch.float32
-            x = x.to(dtype)
+            # Let PyTorch's native AMP autocast handle precision dynamically!
+            dtype = x.dtype
             weight = self.weight.to(dtype)
             
             # Q1 Quantization: Binary weight quantization to {-1, +1}
@@ -130,8 +130,7 @@ if HAS_TORCH:
             self.mlp = BitMLP(embed_dim)
 
         def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
-            dtype = torch.float16 if USE_16BIT else torch.float32
-            x = x.to(dtype)
+            dtype = x.dtype
             x = x + self.attn(self.ln1(x).to(dtype), mask)
             x = x + self.mlp(self.ln2(x).to(dtype))
             return x
@@ -158,11 +157,9 @@ if HAS_TORCH:
         def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
             batch_size, seq_len = input_ids.size()
             device = input_ids.device
-            dtype = torch.float16 if USE_16BIT else torch.float32
             
             positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
             x = self.token_embedding(input_ids) + self.position_embedding(positions)
-            x = x.to(dtype)
             
             mask = torch.tril(torch.ones((seq_len, seq_len), device=device)).view(1, 1, seq_len, seq_len)
             

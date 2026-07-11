@@ -202,7 +202,7 @@ class Trainer:
                     optimizer.zero_grad()
                     
                     # Autocast matrix multiplications to Float16 dynamically
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                    with torch.amp.autocast('cuda', dtype=torch.float16):
                         logits, loss = model(x, y)
                         
                     # Scales the loss and backpropagates gradients safely without FP16 underflows
