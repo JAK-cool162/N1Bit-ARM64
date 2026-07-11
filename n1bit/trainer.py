@@ -90,6 +90,10 @@ class Trainer:
         start_step = 0
         loss_history = []
         
+        # Initialize default values
+        active_batch_size = BATCH_SIZE
+        active_seq_len = SEQ_LEN
+        
         # Load progress if it exists
         resumed = False
         progress_path = self.paths["progress"]
