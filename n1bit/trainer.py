@@ -1,3 +1,4 @@
+import random
 import os
 import json
 import time
@@ -21,6 +22,57 @@ from .utils import optimize_environment
 from .tokenizer import SimpleBPETokenizer
 from .dataset import DatasetEngine
 from .model import NumPyBitRNNLM
+
+# =====================================================================
+# RLAIF SMART REWARD BOT & ALIGNMENT TRAINING
+# =====================================================================
+
+def compute_ai_reward(prompt: str, response: str) -> float:
+    """
+    Reward Bot evaluator: Analyzes the AI's response to prompt and scores it.
+    Returns a reward value between -1.0 (heavy penalty for gibberish) and +1.0 (coherent answer).
+    """
+    response_clean = response.strip()
+    if not response_clean:
+        return -1.0
+        
+    words = response_clean.lower().split()
+    if len(words) < 2:
+        return -0.8
+        
+    # 1. Penalty for repetitiveness
+    unique_ratio = len(set(words)) / len(words)
+    if unique_ratio < 0.3:
+        return -1.0  # Heavy repetitiveness penalty
+        
+    # Penalty for excessive non-alphanumeric junk
+    alnum_ratio = sum(1 for c in response_clean if c.isalnum() or c.isspace()) / len(response_clean)
+    if alnum_ratio < 0.6:
+        return -0.9
+        
+    # 2. Heuristic prompt matching rewards
+    prompt_lower = prompt.lower()
+    reward = 0.0
+    
+    # Check for friendly greeting
+    if "hello" in prompt_lower or "hi" in prompt_lower:
+        greetings = ["hello", "hi", "hey", "greetings", "how can i"]
+        if any(g in response_clean.lower() for g in greetings):
+            reward += 0.6
+            
+    # Check for math question
+    if "1+3" in prompt_lower or "1 + 3" in prompt_lower:
+        if "4" in response_clean:
+            reward += 1.0  # Perfect math reward!
+            
+    # Check for general coherence (presence of English stop words)
+    common_english = ["the", "is", "are", "and", "to", "it", "you", "i", "a", "of", "in", "that"]
+    matches = sum(1 for w in words if w in common_english)
+    if matches >= 1:
+        reward += 0.3
+        
+    return min(max(reward, -1.0), 1.0)
+
 from .vulkan_dispatch import VulkanDispatcher
 
 class Trainer:
@@ -235,7 +287,55 @@ class Trainer:
                     break
                 start_step = 0
                 
-            print(f"[Trainer] Saving final PyTorch checkpoint to {checkpoint_path}")
+            print(f"[Trainer] Saving pre-training PyTorch checkpoint to {checkpoint_path}")
+            torch.save(model.state_dict(), checkpoint_path)
+            
+            # =========================================================
+            # RLAIF POLICY GRADIENT ALIGNMENT FINE-TUNING (Teacher Bot)
+            # =========================================================
+            print("\n[RLAIF] Starting Reward Bot Alignment fine-tuning...")
+            model.train()
+            rl_prompts = [
+                "Hello",
+                "Whats 1+3",
+                "What is a 1-bit neural network?",
+                "How do we optimize LLMs for ARM64 architecture?"
+            ]
+            
+            for rl_step in range(1, 31): # 30 RLAIF steps
+                prompt = random.choice(rl_prompts)
+                prompt_ids = self.tokenizer.encode(f"<instruction>: {prompt}\n<response>:")
+                prompt_ids = [self.tokenizer.bos_id] + prompt_ids
+                
+                # Generate sample response from model
+                output_ids = model.generate(prompt_ids, max_new_tokens=30, temperature=0.7)
+                response_text = self.tokenizer.decode(output_ids[len(prompt_ids):]).strip()
+                
+                # Compute reward
+                reward = compute_ai_reward(prompt, response_text)
+                
+                # REINFORCE update: minimize -log_prob * reward
+                # We calculate standard cross-entropy using output_ids as targets and scale by -reward
+                # This aligns model outputs directly with human preference heuristics!
+                optimizer.zero_grad()
+                x_tensor = torch.tensor([output_ids[:-1]], dtype=torch.long, device=device)
+                y_tensor = torch.tensor([output_ids[1:]], dtype=torch.long, device=device)
+                
+                with torch.amp.autocast('cuda', dtype=torch.float16):
+                    logits, _ = model(x_tensor)
+                    loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y_tensor.reshape(-1))
+                    
+                # Loss weighted by negative reward: high reward -> negative loss -> reinforce tokens!
+                rl_loss = loss * (-reward)
+                
+                scaler.scale(rl_loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                if rl_step % 5 == 0 or rl_step == 1:
+                    print(f"  [RLAIF] Step {rl_step:2d} | Prompt: '{prompt}' | AI: '{response_text[:35]}...' | Reward: {reward:+.2f}")
+                    
+            print("[Trainer] Saving final RLAIF aligned PyTorch checkpoint...")
             torch.save(model.state_dict(), checkpoint_path)
             self.export_to_numpy(model)
             
