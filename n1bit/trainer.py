@@ -53,10 +53,10 @@ class Trainer:
         if os.path.exists(tokenizer_path):
             self.tokenizer.load(tokenizer_path)
 
-    def get_token_chunk_stream(self) -> List[int]:
-        """Streams pre-tokenized integers directly from the binary file as segments of SEQ_LEN + 1."""
+    def get_token_chunk_stream(self, selected_repos: List[str] = None) -> List[int]:
+        """Streams pre-tokenized integers ON-THE-FLY as segments of SEQ_LEN + 1."""
         buffer = []
-        for token in self.engine.stream_processed_tokens():
+        for token in self.engine.stream_processed_tokens(selected_repos=selected_repos):
             buffer.append(token)
             if len(buffer) >= SEQ_LEN + 1:
                 yield buffer[:SEQ_LEN + 1]
@@ -82,7 +82,7 @@ class Trainer:
         to prevent extremely slow PyTorch CPU training.
         """
         # 1. Preprocess raw data directly to pre-tokenized binary array (.bin)
-        self.engine.process_all_datasets(selected_repos=selected_repos)
+        # self.engine.process_all_datasets(selected_repos=selected_repos) # Bypassed to run on-the-fly!
         self.prepare_tokenizer()
         
         vocab_size = len(self.tokenizer.vocab)
@@ -153,7 +153,7 @@ class Trainer:
             
             epoch = start_epoch
             while True:
-                chunk_gen = self.get_token_chunk_stream()
+                chunk_gen = self.get_token_chunk_stream(selected_repos=selected_repos)
                 batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
                 
                 for batch_data in batch_gen:
@@ -250,7 +250,7 @@ class Trainer:
             
             epoch = start_epoch
             while True:
-                chunk_gen = self.get_token_chunk_stream()
+                chunk_gen = self.get_token_chunk_stream(selected_repos=selected_repos)
                 batch_gen = self.get_batch_generator(chunk_gen, BATCH_SIZE)
                 
                 for batch_data in batch_gen:
