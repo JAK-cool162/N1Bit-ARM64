@@ -152,7 +152,7 @@ if HAS_TORCH:
             ])
             
             self.ln_f = nn.LayerNorm(embed_dim)
-            self.lm_head = BitLinear(embed_dim, vocab_size, bias=False)
+            self.lm_head = BitLinear(embed_dim, self.vocab_size, bias=False)
 
         def forward(self, input_ids: torch.Tensor, targets: torch.Tensor = None):
             batch_size, seq_len = input_ids.size()
